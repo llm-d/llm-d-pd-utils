@@ -1,0 +1,43 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-client-roce
+  labels:
+    app: nixl-client
+  annotations:
+    k8s.v1.cni.cncf.io/networks: multi-nic-network
+spec:
+  serviceAccountName: default
+  containers:
+  - name: nixl-client-roce
+    securityContext:
+      capabilities:
+        add:
+        - IPC_LOCK
+    image: quay.io/praveingk/nixl:latest
+    imagePullPolicy: Always
+    command: [
+      '/bin/sh', 
+      '-c', 
+      'sleep infinity']
+    env:
+    - name: UCX_LOG_LEVEL
+      value: "info"
+    resources:
+      limits:
+        nvidia.com/gpu: 2
+        cpu: "64"
+        memory: 1000Gi
+        nvidia.com/roce_gdr: 2
+      requests:
+        nvidia.com/gpu: 2
+        cpu: "64"
+        memory: 1000Gi
+        nvidia.com/roce_gdr: 2
+    volumeMounts:
+      - name: dshm
+        mountPath: "/dev/shm"
+  volumes:
+    - name: dshm
+      emptyDir:
+      medium: Memory
