@@ -1,0 +1,45 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-server
+  labels:
+    app: nixl-server
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                  - NVIDIA-A100-SXM4-80GB
+  containers:
+  - name: nixl-server
+    image: quay.io/praveingk/nixl:latest
+    imagePullPolicy: IfNotPresent
+    command: [
+      '/bin/sh', 
+      '-c', 
+      'sleep infinity']
+    env:
+    - name: UCX_LOG_LEVEL
+      value: "info"
+    resources:
+      requests:
+        nvidia.com/gpu: 1
+      limits:
+        nvidia.com/gpu: 1
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: nixl-server
+spec:
+  type: NodePort
+  selector:
+    app: nixl-server
+  ports:
+    - port: 5555
+      targetPort: 5555
+      nodePort: 30002

@@ -1,0 +1,27 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: nixl-client
+  labels:
+    app: nixl-client
+spec:
+  affinity:
+    nodeAffinity:
+      requiredDuringSchedulingIgnoredDuringExecution:
+        nodeSelectorTerms:
+          - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                  - NVIDIA-A100-SXM4-80GB
+  containers:
+  - name: nixl-client
+    image: quay.io/praveingk/nixl:latest
+    imagePullPolicy: IfNotPresent
+    command: ['/bin/sh', '-c', 'sleep infinity']
+    env:
+    - name: UCX_LOG_LEVEL
+      value: "info"
+    resources:
+      limits:
+        nvidia.com/gpu: 1
