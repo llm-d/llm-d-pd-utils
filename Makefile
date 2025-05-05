@@ -1,5 +1,5 @@
 # Defaults
-PROJECT_NAME ?= llmd-pd-utils
+PROJECT_NAME ?= llm-d-pd-utils
 DEV_VERSION ?= 0.0.1
 PROD_VERSION ?= 0.0.0
 IMAGE_TAG_BASE ?= quay.io/llm-d/$(PROJECT_NAME)
