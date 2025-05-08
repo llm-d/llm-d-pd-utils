@@ -40,4 +40,4 @@ spec:
   volumes:
     - name: dshm
       emptyDir:
-      medium: Memory
+        medium: Memory
