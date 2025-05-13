@@ -617,4 +617,7 @@ spec:
         secretName: "git-auth-secret-neuralmagic"
     - name: registry-secret
       secret:
-        secretName: quay-secret-llm-d
+        secretName: quay-secret-llm-d    
+    - name: registry-secret
+      secret:
+        secretName: ghcr-secret-llm-d
