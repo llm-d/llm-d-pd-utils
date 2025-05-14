@@ -44,7 +44,6 @@ def parse_args():
     parser.add_argument("--hidden-dim", type=int, default=1024, help="Hidden dimension of each block")
     parser.add_argument("--threads", type=int, default=1, help="Number of parallel threads to run")
     parser.add_argument("--iters", type=int, default=1, help="Number of transfer iters to run")
-    parser.add_argument("--agents", type=int, default=1, help="Number of agent pairs to run")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="Data type of the blocks")
 
     parser.add_argument("--role", type=str, required=True, help="Role of the agent ('creator' or 'peer')")
@@ -66,7 +65,6 @@ def init_zmq_socket(host, port, role):
         zmq_socket.connect(f"tcp://{host}:{port}")
         # Ensure the socket is ready to receive messages
         zmq_socket.setsockopt(zmq.LINGER, 0)
-        #zmq_socket.setsockopt(zmq.RCVTIMEO, 1000)
 
     logger.info(f"Initialized ZMQ socket(port {port}) for role: {role}")
     return zmq_socket
@@ -254,8 +252,6 @@ def start_agent_pair(agent_name, device, op, uid):
             end = time.perf_counter()
             transfer_time = end - start
             transfer_speed = size / transfer_time
-        # logger.info(f"Transfer completed in {transfer_time:.2f} seconds")
-        # logger.info(f"Total size of transfer: {size:.2f} GB")
             logger.info(f"Round {n}: Transfer speed: {transfer_speed:.2f} GB/s")
 
         # Check the result

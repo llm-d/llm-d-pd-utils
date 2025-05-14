@@ -1,0 +1,13 @@
+
+Commands to do manual benchmarking on a OCP cluster
+
+
+1) NIXL
+DEST_IP=10.241.130.7
+# oc exec nixl-server-roce -- sh -c "export UCX_TLS=rc;export UCX_MAX_RNDV_RAILS=2; nohup python3 /workspace/benchmark.py --role peer --operation READ --host 0.0.0.0 --threads 10"
+# oc exec nixl-client-roce -- sh -c "export UCX_TLS=rc;export UCX_MAX_RNDV_RAILS=2; python3 benchmark.py --role creator --operation READ --host $DEST_IP  --threads 10"
+
+2) UCX
+DEST_IP=10.241.130.7
+# oc exec -it nixl-server-roce -- sh -c "export UCX_TLS=rc;export UCX_MAX_RNDV_RAILS=2; export UCX_LOG_LEVEL=info; ucx_perftest -p 5555"
+# oc exec nixl-client-roce -- sh -c "export UCX_TLS=rc; ucx_perftest -t tag_bw -s 1048576 -n 100000 -D zcopy -p 5556 $DEST_IP"
