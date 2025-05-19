@@ -1,18 +1,33 @@
-# Refer to golangci-lint's example config file for more options and information:
-# https://github.com/golangci/golangci-lint/blob/master/.golangci.reference.yml
 version: "2"
 
 run:
   timeout: 5m
-  modules-download-mode: readonly
+  allow-parallel-runners: true
+
+formatters:
+  enable:
+  - goimports
+  - gofmt
 
 linters:
   enable:
-    - errcheck
-    - govet
-    - staticcheck
-
-issues:
-  exclude-use-default: false
-  max-issues-per-linter: 0
-  max-same-issues: 0
+  - copyloopvar
+  - dupword
+  - durationcheck
+  - fatcontext
+  - ginkgolinter
+  - gocritic
+  - govet
+  - loggercheck
+  - misspell
+  - perfsprint
+  - revive
+  - unconvert
+  - makezero
+  - errcheck
+  - goconst
+  - ineffassign
+  - nakedret
+  - prealloc
+  - unparam
+  - unused
