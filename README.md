@@ -4,8 +4,8 @@
 
 ```bash
 docker build -t nixl:latest .
-docker tag nixl:latest quay.io/<>/nixl:latest
-docker push quay.io/<>/nixl:latest
+docker tag nixl:latest ghcr.io/<>/nixl:latest
+docker push ghcr.io/<>/nixl:latest
 ```
 
 ## Deploy & Test

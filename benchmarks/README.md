@@ -41,4 +41,6 @@ benchmark.py --role creator --operation READ --host <NODE1_IP> --device cuda
 --block-size: <int>, default 256
 --hidden-size: <int>, default 1024
 --dtype: bfloat16 
+--threads: <int>, default 1
+--iters: <int>, default 1
 ```

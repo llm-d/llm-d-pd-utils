@@ -16,7 +16,7 @@ spec:
                   - NVIDIA-A100-SXM4-80GB
   containers:
   - name: nixl-client
-    image: quay.io/praveingk/nixl:latest
+    image: quay.io/llm-d/llm-d-model-service-dev:latest
     imagePullPolicy: IfNotPresent
     command: ['/bin/sh', '-c', 'sleep infinity']
     env:

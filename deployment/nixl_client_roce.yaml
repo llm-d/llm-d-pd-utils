@@ -14,25 +14,25 @@ spec:
       capabilities:
         add:
         - IPC_LOCK
-    image: quay.io/praveingk/nixl:latest
+    image: quay.io/llm-d/llm-d-model-service-dev:latest
     imagePullPolicy: Always
     command: [
-      '/bin/sh', 
-      '-c', 
+      '/bin/sh',
+      '-c',
       'sleep infinity']
     env:
     - name: UCX_LOG_LEVEL
       value: "info"
     resources:
-      limits:
-        nvidia.com/gpu: 2
-        cpu: "64"
-        memory: 1000Gi
-        nvidia.com/roce_gdr: 2
       requests:
-        nvidia.com/gpu: 2
-        cpu: "64"
-        memory: 1000Gi
+        nvidia.com/gpu: 1
+        cpu: "4"
+        memory: 8Gi
+        nvidia.com/roce_gdr: 2
+      limits:
+        nvidia.com/gpu: 1
+        cpu: "4"
+        memory: 8Gi
         nvidia.com/roce_gdr: 2
     volumeMounts:
       - name: dshm
@@ -40,4 +40,4 @@ spec:
   volumes:
     - name: dshm
       emptyDir:
-      medium: Memory
+        medium: Memory
