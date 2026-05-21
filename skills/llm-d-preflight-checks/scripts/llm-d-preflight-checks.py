@@ -170,7 +170,7 @@ def run_server(start_port):
     shutdown_event.wait()
 
     print("Shutting down preflight server...")
-    server.shutdown()
+    server.server_close()
     print("Continuing...")
 
 

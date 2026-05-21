@@ -66,17 +66,18 @@ Options:
   -e, --explain         Show the kubectl/shell commands used to determine
                         each finding, so results can be reproduced manually.
   -g, --gid-index INDEX GID index for RoCE.  Auto-detected if not specified.
-  -x, --explain-verify  Run each explain command and verify it produces
-                        expected output.  Implies --explain.  Use with -d
-                        for a full self-test of the discovery logic.
   -h, --help            Show this help message.
   -i, --install-deps    Install all test dependencies on every pod:
                         iperf3, perftest build tools, etcd, and nixlbench.
                         Builds perftest and nixlbench from source if missing.
   -l, --label SELECTOR  Label selector to discover pods (default:
-                        "llm-d.ai/inferenceServing=true").
+                        "llm-d.ai/model").
   -n, --namespace NS    Kubernetes namespace for all kubectl commands.
                         Uses current context namespace if not specified.
+  -p, --percentage-margin PCT
+                        Percentage margin for flagging outlier results.
+                        Any result deviating more than PCT% from the average
+                        is flagged (default: 10).
   -r, --rdma-device DEVICE
                         RDMA device to use (e.g. mlx5_0).  Auto-detected if
                         not specified.
@@ -88,24 +89,34 @@ Options:
                         Choices: perftest, iperf3, nccl-rccl, nixlbench, all
                         (default: perftest).  When -t is given explicitly,
                         topology discovery is skipped (use -d to force it).
-  -p, --percentage-margin PCT
-                        Percentage margin for flagging outlier results.
-                        Any result deviating more than PCT% from the average
-                        is flagged (default: 10).
   -v, --verbose         Print kubectl/SSH commands as they run.
-  --ssh-hosts HOSTS     Comma-separated list of SSH hosts to use instead of
-                        kubectl pod discovery.  Format: host1,host2 or
-                        user@host1,user@host2 or host1:ip1,host2:ip2.
-  --ssh-command CMD     SSH command to use (default: "ssh").  Example:
-                        "ssh -i /path/key -o StrictHostKeyChecking=no".
-                        Requires --ssh-hosts.
+  -x, --explain-verify  Run each explain command and verify it produces
+                        expected output.  Implies --explain.  Use with -d
+                        for a full self-test of the discovery logic.
   --nixlbench-backend BACKEND
                         NIXLBench backend (default: UCX).
+  --nixlbench-buffer-size SIZE
+                        NIXLBench total buffer size (default: 8G).
   --nixlbench-seg-type TYPE
                         NIXLBench segment type for initiator and target
                         (default: VRAM).  Choices: DRAM, VRAM.
-  --nixlbench-buffer-size SIZE
-                        NIXLBench total buffer size (default: 8G).
+  --preflight-info      Call GET /info on all pods in preflight pause mode,
+                        display results, and summarize what is shared vs.
+                        different between pods.  Exits without running tests.
+  --preflight-status    Check pod logs for preflight pause-mode indicators.
+                        Reports per-pod whether preflight checks are running
+                        and in what state (paused, completed, or not detected).
+                        Exits without running network tests.
+  --unpause             Call /exit on all pods in preflight pause mode to
+                        resume vLLM startup.  Detects port from logs (tries
+                        8000, then 8200 for decode pods).
+                        Exits without running network tests.
+  --ssh-command CMD     SSH command to use (default: "ssh").  Example:
+                        "ssh -i /path/key -o StrictHostKeyChecking=no".
+                        Requires --ssh-hosts.
+  --ssh-hosts HOSTS     Comma-separated list of SSH hosts to use instead of
+                        kubectl pod discovery.  Format: host1,host2 or
+                        user@host1,user@host2 or host1:ip1,host2:ip2.
 
 Environment variables:
   PERFTEST_LABEL        Label selector (same as -l/--label).
@@ -131,12 +142,18 @@ VERBOSE = "-v" in sys.argv or "--verbose" in sys.argv
 DISCOVER_ONLY = "-d" in sys.argv or "--discover-topology" in sys.argv
 EXPLAIN_VERIFY = "-x" in sys.argv or "--explain-verify" in sys.argv
 EXPLAIN = "-e" in sys.argv or "--explain" in sys.argv or EXPLAIN_VERIFY
+OPT_PREFLIGHT_STATUS = "--preflight-status" in sys.argv
+OPT_UNPAUSE = "--unpause" in sys.argv
+OPT_PREFLIGHT_INFO = "--preflight-info" in sys.argv
 
 DEBUG_IMAGE = os.environ.get("DEBUG_IMAGE", "").strip()
 INSTALL_DEPS = os.environ.get("PERFTEST_INSTALL_DEPS", "").strip() in ("1", "true", "yes")
 OPT_DEVICE = os.environ.get("PERFTEST_DEVICE", "").strip() or None
 OPT_GID_INDEX = os.environ.get("PERFTEST_GID_INDEX", "").strip() or None
-OPT_LABEL = os.environ.get("PERFTEST_LABEL", "").strip() or "llm-d.ai/inferenceServing=true"
+_LABEL_FROM_ENV = os.environ.get("PERFTEST_LABEL", "").strip()
+if _LABEL_FROM_ENV.endswith("=") and "=" not in _LABEL_FROM_ENV[:-1]:
+    _LABEL_FROM_ENV = _LABEL_FROM_ENV[:-1]
+OPT_LABEL = _LABEL_FROM_ENV or "llm-d.ai/model"
 OPT_NAMESPACE = os.environ.get("PERFTEST_NAMESPACE", "").strip() or None
 OPT_TESTS = "perftest"
 _TESTS_EXPLICIT = False  # True when -t/--tests was passed on CLI
@@ -171,9 +188,13 @@ for _i, _arg in enumerate(sys.argv[1:], 1):
         OPT_GID_INDEX = _arg.split("=", 1)[1]
     elif _arg in ("-l", "--label") and _i < len(sys.argv) - 1:
         OPT_LABEL = sys.argv[_i + 1]
+        if OPT_LABEL.endswith("=") and "=" not in OPT_LABEL[:-1]:
+            OPT_LABEL = OPT_LABEL[:-1]
         _skip_next = True
     elif _arg.startswith("--label="):
         OPT_LABEL = _arg.split("=", 1)[1]
+        if OPT_LABEL.endswith("=") and "=" not in OPT_LABEL[:-1]:
+            OPT_LABEL = OPT_LABEL[:-1]
     elif _arg in ("-n", "--namespace") and _i < len(sys.argv) - 1:
         OPT_NAMESPACE = sys.argv[_i + 1]
         _skip_next = True
@@ -545,19 +566,261 @@ def generate_combined_png(pods, all_results, display_names, output="all.png"):
 
 
 # ===========================================================================
+# Preflight check helpers
+# ===========================================================================
+import re as _re
+
+
+def _get_pod_logs(pod_name, tail=50):
+    """Fetch the last `tail` lines of logs from a pod."""
+    ns = _common._kubectl_ns_args()
+    cmd = ["kubectl", "logs"] + ns + [pod_name, "--tail", str(tail)]
+    result = _common.run_cmd(cmd, timeout=30)
+    if result.returncode != 0:
+        return ""
+    return result.stdout
+
+
+def _detect_preflight_port(log_text):
+    """Parse preflight server port from log text. Returns int or None."""
+    m = _re.search(r"Preflight server listening on :(\d+)", log_text)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+def _detect_port_for_pod(pod_name):
+    """Detect preflight port: try logs first, then probe 8000/8200.
+
+    Distinguishes the preflight server from other services (vLLM, sidecars)
+    by checking that /health returns the preflight-specific JSON body.
+    """
+    logs = _get_pod_logs(pod_name, tail=500)
+    port = _detect_preflight_port(logs)
+    if port is not None:
+        return port, logs
+
+    for try_port in (8000, 8200):
+        result = _common.exec_in_pod(
+            pod_name, ["curl", "-s", f"http://localhost:{try_port}/health"], timeout=5
+        )
+        if result.returncode == 0 and '"status"' in result.stdout and "ok" in result.stdout:
+            return try_port, logs
+    return None, logs
+
+
+def _preflight_status(pods, display_names):
+    """Check pod logs and HTTP probes for preflight pause-mode state."""
+    print("\n=== Preflight Status Check ===\n")
+
+    paused_markers = [
+        "=== Preflight checks PAUSED: waiting for /exit before allowing regular pod startup ===",
+        "=== PAUSED: vLLM startup is on hold ===",
+    ]
+    starting_marker = "=== llm-d-preflight-checks.py starting ==="
+    pause_mode_marker = "(mode='pause')"
+    shutdown_marker = "Shutting down preflight server..."
+    continuing_marker = "Continuing..."
+
+    for name, _ip in pods:
+        dname = display_names[name]
+        logs = _get_pod_logs(name, tail=500)
+
+        if not logs:
+            print(f"  {dname}: (no logs available)")
+            continue
+
+        has_starting = starting_marker in logs
+        has_paused = any(m in logs for m in paused_markers)
+        has_pause_mode = pause_mode_marker in logs
+        has_shutdown = shutdown_marker in logs
+        has_continuing = continuing_marker in logs
+        port = _detect_preflight_port(logs)
+
+        # If log markers indicate pause mode but we didn't find the port,
+        # probe the HTTP server to confirm it's still active
+        if (has_paused or has_pause_mode) and not has_shutdown:
+            if port is None:
+                port, _ = _detect_port_for_pod(name)
+            if port is not None:
+                result = _common.exec_in_pod(
+                    name, ["curl", "-s", f"http://localhost:{port}/health"], timeout=5
+                )
+                if result.returncode == 0 and "ok" in result.stdout:
+                    print(f"  {dname}: PAUSED — HTTP server active on port {port}")
+                else:
+                    print(f"  {dname}: COMPLETED — preflight ran (pause mode) but server no longer responding")
+            else:
+                print(f"  {dname}: PAUSED (port unknown) — logs show pause mode but could not detect port")
+        elif has_shutdown and has_continuing:
+            print(f"  {dname}: COMPLETED — preflight exited, vLLM continuing")
+        elif has_starting and not has_pause_mode:
+            print(f"  {dname}: RUNNING — preflight started (not in pause mode)")
+        elif not has_starting:
+            # No log markers at all — try probing HTTP health as last resort
+            probe_port, _ = _detect_port_for_pod(name)
+            if probe_port is not None:
+                result = _common.exec_in_pod(
+                    name, ["curl", "-s", f"http://localhost:{probe_port}/health"], timeout=5
+                )
+                if result.returncode == 0 and "ok" in result.stdout:
+                    print(f"  {dname}: PAUSED — HTTP server active on port {probe_port} (no log markers in last 500 lines)")
+                else:
+                    print(f"  {dname}: NOT DETECTED — no preflight indicators found")
+            else:
+                print(f"  {dname}: NOT DETECTED — no preflight indicators found")
+        else:
+            print(f"  {dname}: UNKNOWN — preflight started but state unclear")
+    print()
+
+
+def _preflight_unpause(pods, display_names):
+    """Call /exit on all discovered pods to resume vLLM startup."""
+    print("\n=== Unpausing Preflight (calling /exit) ===\n")
+
+    for name, _ip in pods:
+        dname = display_names[name]
+        port, _logs = _detect_port_for_pod(name)
+
+        if port is None:
+            print(f"  {dname}: SKIP — could not detect preflight port")
+            continue
+
+        result = _common.exec_in_pod(
+            name, ["curl", "-s", f"http://localhost:{port}/exit"], timeout=10
+        )
+        if result.returncode == 0 and "shutting down" in result.stdout:
+            print(f"  {dname}: OK — /exit called on port {port}")
+        else:
+            stderr_hint = f" ({result.stderr.strip()})" if result.stderr and result.stderr.strip() else ""
+            print(f"  {dname}: FAILED — port {port}, rc={result.returncode}{stderr_hint}")
+    print()
+
+
+def _parse_info_sections(text):
+    """Parse ===== section_name ===== delimited text into dict."""
+    sections = {}
+    current_section = None
+    lines = []
+    for line in text.split("\n"):
+        m = _re.match(r"^=====\s+(.+?)\s+=====\s*$", line)
+        if m:
+            if current_section is not None:
+                sections[current_section] = "\n".join(lines)
+            current_section = m.group(1)
+            lines = []
+        else:
+            lines.append(line)
+    if current_section is not None:
+        sections[current_section] = "\n".join(lines)
+    return sections
+
+
+def _preflight_info(pods, display_names):
+    """Call GET /info on all pods, display results, summarize shared vs different."""
+    print("\n=== Preflight Info Collection ===\n")
+
+    pod_infos = {}
+
+    for name, _ip in pods:
+        dname = display_names[name]
+        port, _logs = _detect_port_for_pod(name)
+
+        if port is None:
+            print(f"  {dname}: SKIP — could not detect preflight port")
+            continue
+
+        result = _common.exec_in_pod(
+            name, ["curl", "-s", f"http://localhost:{port}/info"], timeout=30
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            pod_infos[dname] = result.stdout
+            print(f"  {dname}: OK — collected info from port {port}")
+        else:
+            print(f"  {dname}: FAILED — no info returned from port {port}")
+
+    if not pod_infos:
+        print("\nNo info collected from any pod.")
+        return
+
+    all_sections = {dname: _parse_info_sections(text) for dname, text in pod_infos.items()}
+
+    # Collect all section names preserving first-seen order
+    all_section_names = []
+    seen = set()
+    for sections in all_sections.values():
+        for sname in sections:
+            if sname not in seen:
+                all_section_names.append(sname)
+                seen.add(sname)
+
+    pod_names_list = list(pod_infos.keys())
+
+    print(f"\n{'=' * 60}")
+    print(f"  INFO COMPARISON ({len(pod_infos)} pods)")
+    print(f"{'=' * 60}")
+
+    shared_sections = []
+    different_sections = []
+
+    for section_name in all_section_names:
+        contents = [all_sections.get(d, {}).get(section_name, "(missing)") for d in pod_names_list]
+        if len(set(contents)) == 1:
+            shared_sections.append(section_name)
+        else:
+            different_sections.append(section_name)
+
+    if shared_sections:
+        print(f"\n  SHARED (identical across all {len(pod_infos)} pods):")
+        for s in shared_sections:
+            print(f"    - {s}")
+        # Show shared content once
+        first_pod = pod_names_list[0]
+        for s in shared_sections:
+            content = all_sections[first_pod].get(s, "")
+            print(f"\n  ===== {s} =====")
+            for line in content.strip().split("\n"):
+                print(f"    {line}")
+
+    if different_sections:
+        print(f"\n  DIFFERENT (varies between pods):")
+        for s in different_sections:
+            print(f"    - {s}")
+
+        for s in different_sections:
+            print(f"\n  ===== {s} =====")
+            for dname in pod_names_list:
+                content = all_sections.get(dname, {}).get(s, "(missing)")
+                print(f"    [{dname}]:")
+                for line in content.strip().split("\n"):
+                    print(f"      {line}")
+    print()
+
+
+# ===========================================================================
 # Main
 # ===========================================================================
 def main():
-    bw_sizes_str = ", ".join(_common._human_size(s) for s in RDMA_BLOCK_SIZES)
-    print(f"Selected tests: {', '.join(SELECTED_TESTS)}")
-    print(f"RDMA perftest BW message sizes: [{bw_sizes_str}]")
-    print(f"RDMA perftest latency message size: {_common._human_size(RDMA_LATENCY_SIZE)}")
-    print(f"iperf3: uses default buffer sizes (128K TCP, 8K UDP)")
-    if USE_DEBUG_CONTAINER:
-        print(f"Debug image: {DEBUG_IMAGE}")
+    _is_preflight = OPT_PREFLIGHT_STATUS or OPT_UNPAUSE or OPT_PREFLIGHT_INFO
+
+    if _is_preflight:
+        if OPT_PREFLIGHT_STATUS:
+            print("Preflight mode: --preflight-status (no tests will be run)")
+        elif OPT_PREFLIGHT_INFO:
+            print("Preflight mode: --preflight-info (no tests will be run)")
+        elif OPT_UNPAUSE:
+            print("Preflight mode: --unpause (no tests will be run)")
     else:
-        print("Running directly in pod containers (no debug image).")
-    print(f"Install deps if missing: {'yes' if INSTALL_DEPS else 'no (use --install-deps to enable)'}")
+        bw_sizes_str = ", ".join(_common._human_size(s) for s in RDMA_BLOCK_SIZES)
+        print(f"Selected tests: {', '.join(SELECTED_TESTS)}")
+        print(f"RDMA perftest BW message sizes: [{bw_sizes_str}]")
+        print(f"RDMA perftest latency message size: {_common._human_size(RDMA_LATENCY_SIZE)}")
+        print(f"iperf3: uses default buffer sizes (128K TCP, 8K UDP)")
+        if USE_DEBUG_CONTAINER:
+            print(f"Debug image: {DEBUG_IMAGE}")
+        else:
+            print("Running directly in pod containers (no debug image).")
+        print(f"Install deps if missing: {'yes' if INSTALL_DEPS else 'no (use --install-deps to enable)'}")
 
     # Discover pods
     print(f"\nDiscovering pods with label: {OPT_LABEL} ...")
@@ -584,6 +847,17 @@ def main():
         decode_count = sum(1 for n, _ in pods if _common.get_pod_role(n) == "decode")
         print(f"  Cross-role testing: {prefill_count} prefill + {decode_count} decode pods "
               f"→ {len(test_pairs)} cross-role pairs (skipping {all_pairs_count - len(test_pairs)} same-role pairs)")
+
+    # Preflight action options — run and exit without network tests
+    if OPT_PREFLIGHT_STATUS:
+        _preflight_status(pods, display_names)
+        return
+    if OPT_UNPAUSE:
+        _preflight_unpause(pods, display_names)
+        return
+    if OPT_PREFLIGHT_INFO:
+        _preflight_info(pods, display_names)
+        return
 
     # Create debug containers if any test needs them
     if USE_DEBUG_CONTAINER:

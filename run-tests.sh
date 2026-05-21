@@ -9,4 +9,4 @@ if ! command -v uv &>/dev/null; then
     exit 1
 fi
 
-uv run "$SCRIPT_DIR/run-tests.py" "$@"
+uv run "$SCRIPT_DIR/skills/llm-d-networking-tests/scripts/run-tests.py" "$@"

@@ -65,6 +65,74 @@ PERFTEST_DEPS = [
     "pciutils-devel", "automake", "autoconf", "libtool",
 ]
 
+# Non-root .deb extraction paths and URLs
+PERFTEST_NONROOT_DIR = "/tmp/perftest-bin"
+PERFTEST_DEB_URL = "http://archive.ubuntu.com/ubuntu/pool/universe/p/perftest/perftest_4.4+0.37-1_amd64.deb"
+RDMACM_DEB_URL = "http://archive.ubuntu.com/ubuntu/pool/main/r/rdma-core/librdmacm1_39.0-1_amd64.deb"
+LIBIBUMAD_DEB_URL = "http://archive.ubuntu.com/ubuntu/pool/main/r/rdma-core/libibumad3_39.0-1_amd64.deb"
+
+
+# ---------------------------------------------------------------------------
+# Non-root environment detection and helpers
+# ---------------------------------------------------------------------------
+_nonroot_cache = {}
+
+
+def _detect_nonroot(pod_name):
+    """Detect if a pod runs as non-root (cannot write to /usr/local/bin)."""
+    if pod_name in _nonroot_cache:
+        return _nonroot_cache[pod_name]
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         "touch /usr/local/bin/.test_write 2>/dev/null "
+         "&& rm -f /usr/local/bin/.test_write && echo ROOT || echo NONROOT"],
+        use_debug=False,
+    )
+    is_nonroot = "NONROOT" in (result.stdout or "")
+    _nonroot_cache[pod_name] = is_nonroot
+    return is_nonroot
+
+
+def _perftest_env_prefix(pod_name):
+    """Build shell env prefix for non-root pods to find perftest binaries."""
+    if not _detect_nonroot(pod_name):
+        return ""
+    return (
+        f"export PATH={PERFTEST_NONROOT_DIR}:$PATH && "
+        f"export LD_LIBRARY_PATH={PERFTEST_NONROOT_DIR}/lib:${{LD_LIBRARY_PATH:-}} && "
+    )
+
+
+def _install_perftest_nonroot(pod_name, out=None):
+    """Install perftest + librdmacm via .deb extraction for non-root pods."""
+    _out = out or print
+    _out(f"  Installing perftest via .deb extraction on {pod_name} (non-root) ...")
+    script = (
+        f"mkdir -p {PERFTEST_NONROOT_DIR}/lib && "
+        f"cd /tmp && "
+        f"curl -sL -o perftest.deb '{PERFTEST_DEB_URL}' && "
+        f"dpkg-deb -x perftest.deb perftest-extract && "
+        f"cp perftest-extract/usr/bin/* {PERFTEST_NONROOT_DIR}/ && "
+        f"curl -sL -o rdmacm.deb '{RDMACM_DEB_URL}' && "
+        f"dpkg-deb -x rdmacm.deb rdmacm-extract && "
+        f"find rdmacm-extract -name '*.so*' -exec cp {{}} {PERFTEST_NONROOT_DIR}/lib/ \\; && "
+        f"curl -sL -o libibumad.deb '{LIBIBUMAD_DEB_URL}' && "
+        f"dpkg-deb -x libibumad.deb libibumad-extract && "
+        f"find libibumad-extract -name '*.so*' -exec cp {{}} {PERFTEST_NONROOT_DIR}/lib/ \\; && "
+        f"rm -rf perftest.deb rdmacm.deb libibumad.deb perftest-extract rdmacm-extract libibumad-extract && "
+        f"chmod +x {PERFTEST_NONROOT_DIR}/ib_* && "
+        f"test -x {PERFTEST_NONROOT_DIR}/ib_write_bw && echo PERFTEST_INSTALLED"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", script], timeout=120, use_debug=False)
+    if "PERFTEST_INSTALLED" in (result.stdout or ""):
+        _out(f"  perftest installed successfully in {PERFTEST_NONROOT_DIR} on {pod_name}.")
+        return True
+    _out(f"  Warning: perftest .deb install may have failed on {pod_name}.")
+    if result.stderr:
+        _out(f"    stderr: {result.stderr.strip()[:300]}")
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Perftest functions
@@ -79,7 +147,8 @@ def _check_binaries(pod_name, binaries):
         f'(command -v {b} >/dev/null 2>&1 && echo "FOUND:{b}" || echo "MISSING:{b}")'
         for b in binaries
     )
-    result = exec_in_pod(pod_name, ["bash", "-c", checks], use_debug=False)
+    env_prefix = _perftest_env_prefix(pod_name)
+    result = exec_in_pod(pod_name, ["bash", "-c", env_prefix + checks], use_debug=False)
     missing = set()
     if result.returncode != 0:
         return set(binaries)  # assume all missing on failure
@@ -104,6 +173,11 @@ def install_all_deps(pod_name, out=None):
     """
     _out = out or print
     _out(f"  Installing all test dependencies on {pod_name} ...")
+
+    if _detect_nonroot(pod_name):
+        _out(f"  Non-root pod detected, using .deb extraction ...")
+        _install_perftest_nonroot(pod_name, out=_out)
+        return
 
     # Package groups — installed one group at a time so a failure in one
     # (e.g. iputils on a read-only filesystem) doesn't block the rest.
@@ -157,6 +231,8 @@ def install_all_deps(pod_name, out=None):
 def build_perftest(pod_name, out=None):
     """Clone and build perftest from source on a pod's main container."""
     _out = out or print
+    if _detect_nonroot(pod_name):
+        return _install_perftest_nonroot(pod_name, out=_out)
     _out(f"  Cloning perftest on {pod_name} ...")
     exec_in_pod(pod_name, ["rm", "-rf", "/tmp/perftest"], use_debug=False)
     result = exec_in_pod(pod_name, ["git", "clone", PERFTEST_REPO, "/tmp/perftest"], timeout=120, use_debug=False)
@@ -284,18 +360,23 @@ def build_perftest_args(binary, device, gid_index, port, size, server_ip=None):
         args += ["-d", device]
     if gid_index is not None:
         args += ["-x", str(gid_index)]
-    args += ["-F", "-q", "1", "--port", str(port), "--size", str(size)]
+    args += ["-F", "--port", str(port), "--size", str(size)]
     if _is_latency_test(binary):
         args += ["-n", str(_get_common().PERFTEST_ITERATIONS)]
     else:
-        args += ["--report_gbits", "--duration", str(_get_common().PERFTEST_DURATION)]
+        args += ["-q", "1", "--report_gbits", "--duration", str(_get_common().PERFTEST_DURATION)]
     return args
 
 
 def start_perftest_server(server_pod, binary, device, gid_index, port, size, out=None):
     _out = out or print
     ib_args = build_perftest_args(binary, device, gid_index, port, size)
-    cmd = _get_common()._build_remote_cmd(server_pod, [binary] + ib_args)
+    env_prefix = _perftest_env_prefix(server_pod)
+    if env_prefix:
+        cmd_parts = ["bash", "-c", env_prefix + binary + " " + " ".join(ib_args)]
+    else:
+        cmd_parts = [binary] + ib_args
+    cmd = _get_common()._build_remote_cmd(server_pod, cmd_parts)
 
     ib_cmd_str = f"{binary} {' '.join(ib_args)}"
     _out(f"  Server cmd: {ib_cmd_str}")
@@ -311,7 +392,12 @@ def start_perftest_server(server_pod, binary, device, gid_index, port, size, out
 def run_perftest_client(client_pod, binary, server_ip, device, gid_index, port, size, out=None):
     _out = out or print
     ib_args = build_perftest_args(binary, device, gid_index, port, size, server_ip=server_ip)
-    cmd = _get_common()._build_remote_cmd(client_pod, [binary] + ib_args)
+    env_prefix = _perftest_env_prefix(client_pod)
+    if env_prefix:
+        cmd_parts = ["bash", "-c", env_prefix + binary + " " + " ".join(ib_args)]
+    else:
+        cmd_parts = [binary] + ib_args
+    cmd = _get_common()._build_remote_cmd(client_pod, cmd_parts)
 
     ib_cmd_str = f"{binary} {' '.join(ib_args)}"
     _out(f"  Client cmd: {ib_cmd_str}")

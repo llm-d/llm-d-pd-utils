@@ -35,7 +35,7 @@ DEBUG_SUFFIX = "-debug"
 INSTALL_DEPS = False
 OPT_DEVICE = None
 OPT_GID_INDEX = None
-OPT_LABEL = "llm-d.ai/inferenceServing=true"
+OPT_LABEL = "llm-d.ai/model"
 OPT_NAMESPACE = None
 
 SSH_COMMAND = None       # e.g. ["ssh", "-i", "/path/key"]
@@ -148,6 +148,11 @@ def _parse_common_args(argv=None, extra_flags=None):
     raw_pct = cfg.pop("_PCT_MARGIN_RAW", None)
     if raw_pct is not None:
         cfg["OPT_PERCENTAGE_MARGIN"] = float(raw_pct)
+
+    # Strip trailing bare '=' from label (e.g. "llm-d.ai/model=" → "llm-d.ai/model")
+    lbl = cfg.get("OPT_LABEL", "")
+    if lbl.endswith("=") and "=" not in lbl[:-1]:
+        cfg["OPT_LABEL"] = lbl[:-1]
 
     # Handle SSH flags
     ssh_hosts_raw = cfg.pop("_SSH_HOSTS_RAW", None)

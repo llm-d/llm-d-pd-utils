@@ -2519,14 +2519,14 @@ def run_topology_validation(pods, display_names):
                 pod_to_role[pod_name] = "other"
 
         for role in role_order:
-            role_pods = [(pn, ip) for pn, ip in pods if pod_to_role.get(pn) == role]
+            role_pods = [(pod_name, ip) for pod_name, ip in pods if pod_to_role.get(pod_name) == role]
             print(f"\n  {role.upper()} pods ({len(role_pods)}):")
 
             # GPU interconnect for this role
             role_conn_types = set()
             role_gpu_counts = set()
-            for pn, _ in role_pods:
-                topo = all_pod_results.get(pn, {})
+            for pod_name, _ in role_pods:
+                topo = all_pod_results.get(pod_name, {})
                 role_gpu_counts.add(topo.get("gpu_count", 0))
                 for (g1, g2), conn in topo.get("connections", {}).items():
                     if g1 != g2 and conn != "X":
@@ -2551,8 +2551,8 @@ def run_topology_validation(pods, display_names):
             role_rdma_counts = set()
             role_active_counts = set()
             role_link_layers = set()
-            for pn, _ in role_pods:
-                topo = all_pod_results.get(pn, {})
+            for pod_name, _ in role_pods:
+                topo = all_pod_results.get(pod_name, {})
                 devs = topo.get("rdma_devices", [])
                 role_rdma_counts.add(len(devs))
                 env = topo.get("nccl_env", {})
@@ -2590,8 +2590,8 @@ def run_topology_validation(pods, display_names):
                 print(f"    Network group:   no RDMA devices")
 
             ib_dis = any(
-                all_pod_results.get(pn, {}).get("nccl_env", {}).get("NCCL_IB_DISABLE") == "1"
-                for pn, _ in role_pods
+                all_pod_results.get(pod_name, {}).get("nccl_env", {}).get("NCCL_IB_DISABLE") == "1"
+                for pod_name, _ in role_pods
             )
             if ib_dis:
                 print(f"    IB/RoCE:         DISABLED on some/all pods")

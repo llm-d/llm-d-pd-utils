@@ -72,6 +72,14 @@ NONROOT_NIXLBENCH_PREFIX = "/tmp/nixlbench"
 NIXL_PIP_LIBS = "/usr/local/lib/python3.12/dist-packages/.nixl_cu12.mesonpy.libs"
 NIXL_PIP_UCX_LIBS = "/usr/local/lib/python3.12/dist-packages/nixl_cu12.libs"
 
+# Source builds for non-root pods (gdrcopy + UCX from source)
+GDRCOPY_VER = "2.5"
+GDRCOPY_URL = f"https://github.com/NVIDIA/gdrcopy/archive/refs/tags/v{GDRCOPY_VER}.tar.gz"
+NONROOT_GDR_HOME = f"{NONROOT_PREFIX}/gdrcopy"
+UCX_VER = "1.18.0"
+UCX_SRC_URL = f"https://github.com/openucx/ucx/releases/download/v{UCX_VER}/ucx-{UCX_VER}.tar.gz"
+NONROOT_UCX_HOME = f"{NONROOT_PREFIX}/ucx"
+
 # Defaults — overridden via configure() from run-tests.py
 NIXLBENCH_BACKEND = "UCX"
 NIXLBENCH_SEG_TYPE = "VRAM"
@@ -113,6 +121,7 @@ def _nonroot_env_prefix(pod_name):
         f'{NONROOT_NIXL_PREFIX}/lib64:{NONROOT_NIXL_PREFIX}/lib64/plugins:'
         f'{NONROOT_NIXL_PREFIX}/lib/$(uname -m)-linux-gnu:'
         f'{NONROOT_NIXL_PREFIX}/lib/$(uname -m)-linux-gnu/plugins:'
+        f'{NONROOT_UCX_HOME}/lib:{NONROOT_GDR_HOME}/lib:'
         f'{NONROOT_PREFIX}/lib64:{NONROOT_PREFIX}/lib:'
         f'{NIXL_PIP_LIBS}:{NIXL_PIP_UCX_LIBS}:'
         f'/usr/local/lib64:/usr/local/lib:${{LD_LIBRARY_PATH:-}} && '
@@ -325,6 +334,103 @@ def _install_deps_nonroot(pod_name, out=None):
 
     _out(f"  Build dependencies ready on {pod_name}.")
     return True
+
+
+def _build_gdrcopy_nonroot(pod_name, out=None):
+    """Build gdrcopy from source for non-root pods (userspace lib only, skips insmod)."""
+    _out = out or print
+    # Check if already built
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"test -f {NONROOT_GDR_HOME}/lib/libgdrapi.so && echo FOUND"],
+        use_debug=False,
+    )
+    if result.returncode == 0 and "FOUND" in (result.stdout or ""):
+        _out(f"    gdrcopy already installed at {NONROOT_GDR_HOME}")
+        return True
+
+    _out(f"  Building gdrcopy v{GDRCOPY_VER} on {pod_name} ...")
+    build_cmd = (
+        f"export HOME=/tmp && export PATH={NONROOT_BIN}:$PATH && "
+        f"mkdir -p /tmp/nixl_installer && cd /tmp/nixl_installer && "
+        f"curl -sL {GDRCOPY_URL} -o gdrcopy.tar.gz && "
+        f"tar xzf gdrcopy.tar.gz && rm gdrcopy.tar.gz && "
+        f"cd gdrcopy-{GDRCOPY_VER} && "
+        f"make prefix={NONROOT_GDR_HOME} CUDA=/usr/local/cuda all install 2>&1 | tail -5 && "
+        f"test -f {NONROOT_GDR_HOME}/lib/libgdrapi.so && echo GDRCOPY_OK"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", build_cmd], timeout=300, use_debug=False)
+    if "GDRCOPY_OK" not in (result.stdout or ""):
+        _out(f"    Warning: gdrcopy build failed (non-fatal, UCX will build without GDR)")
+        if _get_common().VERBOSE and result.stderr:
+            _out(f"    stderr: {result.stderr.strip()[-300:]}")
+        return False
+    _out(f"    gdrcopy installed at {NONROOT_GDR_HOME} (skipped insmod — host kernel module)")
+    return True
+
+
+def _build_ucx_from_source(pod_name, out=None):
+    """Build UCX from source for non-root pods when no existing UCX is available."""
+    _out = out or print
+    # Check if already built
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"test -f {NONROOT_UCX_HOME}/lib/libucp.so && echo FOUND"],
+        use_debug=False,
+    )
+    if result.returncode == 0 and "FOUND" in (result.stdout or ""):
+        _out(f"    UCX already installed at {NONROOT_UCX_HOME}")
+        return NONROOT_UCX_HOME
+
+    _out(f"  Building UCX v{UCX_VER} from source on {pod_name} ...")
+
+    # Detect Mellanox/IB for configure flags
+    mlx_check = exec_in_pod(
+        pod_name,
+        ["bash", "-c",
+         "(command -v lspci >/dev/null 2>&1 && lspci | grep -qi mellanox && echo MLX) || "
+         "(command -v ibstat >/dev/null 2>&1 && echo MLX) || echo NONE"],
+        use_debug=False,
+    )
+    mlx_opts = ""
+    if "MLX" in (mlx_check.stdout or ""):
+        mlx_opts = "--with-rdmacm --with-mlx5-dv --with-ib-hw-tm"
+        _out(f"    Mellanox/IB detected, enabling RDMA options")
+
+    # gdrcopy flag
+    gdr_opt = ""
+    gdr_check = exec_in_pod(
+        pod_name,
+        ["bash", "-c", f"test -f {NONROOT_GDR_HOME}/lib/libgdrapi.so && echo FOUND"],
+        use_debug=False,
+    )
+    if "FOUND" in (gdr_check.stdout or ""):
+        gdr_opt = f"--with-gdrcopy={NONROOT_GDR_HOME}"
+
+    build_cmd = (
+        f"export HOME=/tmp && export PATH={NONROOT_BIN}:$PATH && "
+        f"export LD_LIBRARY_PATH={NONROOT_GDR_HOME}/lib:${{LD_LIBRARY_PATH:-}} && "
+        f"mkdir -p /tmp/nixl_installer && cd /tmp/nixl_installer && "
+        f"curl -sL {UCX_SRC_URL} -o ucx.tar.gz && "
+        f"tar xzf ucx.tar.gz && rm ucx.tar.gz && "
+        f"cd ucx-{UCX_VER} && "
+        f"./configure --prefix={NONROOT_UCX_HOME} "
+        f"--enable-shared --disable-static --disable-doxygen-doc "
+        f"--enable-optimizations --enable-cma --enable-devel-headers "
+        f"--with-cuda=/usr/local/cuda --with-dm --with-verbs --enable-mt "
+        f"{gdr_opt} {mlx_opts} 2>&1 | tail -10 && "
+        f"make -j$(nproc) 2>&1 | tail -5 && "
+        f"make install-strip 2>&1 | tail -5 && "
+        f"test -f {NONROOT_UCX_HOME}/lib/libucp.so && echo UCX_OK"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", build_cmd], timeout=600, use_debug=False)
+    if "UCX_OK" not in (result.stdout or ""):
+        _out(f"    UCX build failed")
+        if _get_common().VERBOSE and result.stderr:
+            _out(f"    stderr: {result.stderr.strip()[-300:]}")
+        return None
+    _out(f"    UCX installed at {NONROOT_UCX_HOME} (using LD_LIBRARY_PATH)")
+    return NONROOT_UCX_HOME
 
 
 def install_nixlbench_deps(pod_name, out=None):
@@ -743,6 +849,14 @@ def build_nixl(pod_name, out=None):
         ucx_path = _setup_ucx_prefix_from_pip(pod_name, out=_out)
     if ucx_path:
         _out(f"    Found UCX at {ucx_path}")
+    elif nonroot and _get_common().INSTALL_DEPS:
+        # No UCX found on non-root pod — build gdrcopy + UCX from source
+        _build_gdrcopy_nonroot(pod_name, out=_out)
+        ucx_path = _build_ucx_from_source(pod_name, out=_out)
+        if ucx_path:
+            _out(f"    Built UCX from source at {ucx_path}")
+        else:
+            _out(f"    Warning: UCX build from source failed, NIXL build may fail.")
     else:
         _out(f"    Warning: UCX not found, NIXL build may fail.")
 

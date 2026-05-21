@@ -5,7 +5,7 @@ description: Run networking tests for LLM-D to ensure the environment is properl
 
 There are two steps to verify network performance of llm-d model deployment. First, after the model is deployed verify the topology of llm-d pods used by the model. For each pod if there are multiple GPUs allocated verify that they are optimally connected, in particular that they are as close as possible connected in PCIe with interconnects such as NVLink and NVSwitch for NVIDIA and Infinity Fabric and UALink for AMD. Second, for communication between pods verify that network fabric such Infiniband or RoCE is configured inside llm-d pods for expected latency and bandwidth.
 
-Use provided automation scripts run-test*.sh from https://github.com/llm-d/llm-d-pd-utils (if they are not availabel use https://github.com/aslom/llm-d-pd-utils).
+Use provided automation scripts run-test*.sh from scripts/ directory to run the tests. 
 
 Ask user what namespace to use for tests (--namespace NS parameter in test scripts) and what pods label selector to use for testing (e.g. --label "llm-d.ai/role=decode" or "llm-d.ai/role=prefill"). The scripts will run tests in all pods matching the label selector.
 
