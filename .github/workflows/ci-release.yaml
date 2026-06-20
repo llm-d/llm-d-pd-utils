@@ -24,7 +24,7 @@ jobs:
         run: df -h
 
       - name: Checkout source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Set project name from repository
         id: version
