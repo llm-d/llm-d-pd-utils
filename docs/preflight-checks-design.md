@@ -36,7 +36,7 @@ Apart from preflight checks, to automate testing, we also provide scripts and an
 
 
 ```
-follow https://llm-d.ai/docs/getting-started/quickstart to install llm-d in llm-d-quickstart namspace and run /llm-d-preflight-checks in that namespace to use preflight checks script in installed pods. if necessary add or modify or locally load helm chars to add preflight checks script and env variable LLMD_PREFLIGHT_CHECKS with "pause"
+follow https://llm-d.ai/docs/getting-started/quickstart to install llm-d in llm-d-quickstart namespace and run /llm-d-preflight-checks in that namespace to use preflight checks script in installed pods. if necessary add or modify or locally load helm chars to add preflight checks script and env variable LLMD_PREFLIGHT_CHECKS with "pause"
 ```
 
 ```
