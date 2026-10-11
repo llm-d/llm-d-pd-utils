@@ -112,6 +112,7 @@ def make_handler(shutdown_event):
 
     # Cache info output so repeated /info calls are fast
     info_cache = {}
+    info_lock = threading.Lock()
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -123,9 +124,10 @@ def make_handler(shutdown_event):
                 shutdown_event.set()
 
             elif self.path == "/info":
-                if "text" not in info_cache:
-                    sections = gather_info()
-                    info_cache["text"] = build_info_text(sections)
+                with info_lock:
+                    if "text" not in info_cache:
+                        sections = gather_info()
+                        info_cache["text"] = build_info_text(sections)
                 self.send_response(200)
                 self.send_header("Content-Type", "text/plain; charset=utf-8")
                 self.end_headers()
@@ -152,7 +154,9 @@ def run_server(start_port):
     shutdown_event = threading.Event()
     handler_class = make_handler(shutdown_event)
 
-    server = http.server.HTTPServer(("", port), handler_class)
+    server = http.server.ThreadingHTTPServer(("", port), handler_class)
+    # Finish pending diagnostics before continuing to vLLM startup.
+    server.daemon_threads = False
     server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
@@ -170,6 +174,8 @@ def run_server(start_port):
     shutdown_event.wait()
 
     print("Shutting down preflight server...")
+    server.shutdown()
+    server_thread.join()
     server.server_close()
     print("Continuing...")
 
