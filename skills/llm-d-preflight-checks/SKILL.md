@@ -143,7 +143,7 @@ kubectl exec -n ${NAMESPACE} <pod-name> -- curl -s http://localhost:8000/health
 # Returns: {"status":"ok"}
 
 kubectl exec -n ${NAMESPACE} <pod-name> -- curl -s http://localhost:8000/info
-# Returns: full system diagnostics (env, GPU topology, NVLink, lscpu)
+# Returns: full system diagnostics (env, GPU topology, NVLink/xGMI/Xe Link, lscpu)
 ```
 
 ### Step 6: Resume vLLM startup

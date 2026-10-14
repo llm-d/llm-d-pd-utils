@@ -1,19 +1,26 @@
 # /// script
 # requires-python = ">=3.10"
 # ///
-"""NCCL/RCCL collective operation test runner for Kubernetes inference pods.
+"""Collective operation test runner for Kubernetes inference pods.
 
-Detects GPU vendor per pod (NVIDIA vs AMD), builds nccl-tests or rccl-tests
-from source if needed, sets up passwordless SSH for mpirun, runs
-all_reduce_perf across same-vendor pods, and displays results.
+Detects GPU vendor per pod (NVIDIA / AMD / Intel XPU).  For NVIDIA and AMD
+it builds nccl-tests or rccl-tests from source if needed and runs
+all_reduce_perf.  For Intel XPU it builds the oneCCL example `benchmark`
+binary and runs its allreduce via mpirun.  In all cases it sets up
+passwordless SSH for mpirun and displays results.
 
 Public API:
     run_nccl_rccl(pods, display_names) -> dict
 """
 
+import csv
+import math
+import re
+import shlex
 import subprocess
 import sys
 import threading
+import uuid
 
 from importlib import import_module
 
@@ -60,28 +67,175 @@ OPENMPI_URL = (f"https://download.open-mpi.org/release/open-mpi/v4.1/"
                f"openmpi-{OPENMPI_VERSION}.tar.gz")
 OPENMPI_BUILD_DIR = "/tmp/openmpi-build"
 
-# Default all_reduce_perf arguments
+# Shared AllReduce workload (using the RCCL iteration defaults).
 AR_MIN_BYTES = "8"
 AR_MAX_BYTES = "128M"
 AR_FACTOR = "2"
 AR_GPUS_PER_PROC = "1"
+AR_ITERS = "20"
+AR_WARMUP_ITERS = "5"
 
 # SSH port for sshd in pods
 SSHD_PORT = 22
+
+# oneCCL example benchmark shipped with oneAPI.
+XCCL_BENCH_DIR = "/tmp/llm-d-xccl-bench"
+XCCL_BENCH_BINARY = f"{XCCL_BENCH_DIR}/benchmark"
+_ONEAPI_ENV = (
+    "source /opt/intel/oneapi/setvars.sh --force >/dev/null && "
+    'test -n "$CCL_ROOT" && test -n "$I_MPI_ROOT" && '
+)
+
+
+def find_intel_mpirun(pod_name):
+    """Locate the Intel MPI installation used to link the oneCCL benchmark."""
+    script = (
+        _ONEAPI_ENV +
+        '"$I_MPI_ROOT/bin/mpirun" --version && '
+        'printf "\\nMPI_PATH=%s/bin/mpirun\\n" "$I_MPI_ROOT"'
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", script], timeout=30, use_debug=False)
+    if result.returncode == 0 and re.search(r"Intel(?:\(R\))?\s+MPI", result.stdout, re.IGNORECASE):
+        for line in result.stdout.splitlines():
+            if line.startswith("MPI_PATH="):
+                return line.partition("=")[2]
+    print(f"  Error: Intel MPI unavailable on {pod_name}. Install the oneAPI "
+          f"compiler, oneCCL examples/development files and Intel MPI; "
+          f"OpenMPI cannot launch this Intel-MPI-linked benchmark. "
+          f"{(result.stderr or result.stdout or '')[-300:]}")
+    return None
+
+
+def _xccl_bench_available(pod_name):
+    """True if the oneCCL benchmark binary exists in the pod."""
+    result = exec_in_pod(pod_name, ["test", "-x", XCCL_BENCH_BINARY],
+                         timeout=10, use_debug=False)
+    return result.returncode == 0
+
+
+def ensure_xccl_bench(pod_name, out=None):
+    """Build the oneCCL example with the oneAPI compiler and Intel MPI."""
+    _out = out or print
+    if _xccl_bench_available(pod_name):
+        _out(f"  oneCCL benchmark already available on {pod_name}.")
+        return True
+    if not _get_common().INSTALL_DEPS:
+        _out(f"  Error: oneCCL benchmark not found on {pod_name}. "
+             "Re-run with --install-deps (requires oneAPI compiler and development files).")
+        return False
+    _out(f"  Building oneCCL benchmark on {pod_name} ...")
+    build = (
+        _ONEAPI_ENV +
+        "E=$CCL_ROOT/share/doc/ccl/examples && "
+        f"mkdir -p {XCCL_BENCH_DIR} && cd {XCCL_BENCH_DIR} && "
+        "icpx -std=c++17 -fsycl -O2 "
+        "-I $E/benchmark/include -I $E/benchmark/src -I $E/include -I $CCL_ROOT/include "
+        "$E/benchmark/src/benchmark.cpp "
+        "-L $CCL_ROOT/lib -lccl -L $I_MPI_ROOT/lib/release -lmpi "
+        f"-lpthread -lrt -lm -ldl -o {XCCL_BENCH_BINARY} && "
+        f"test -x {XCCL_BENCH_BINARY} && echo XCCL_BUILD_OK"
+    )
+    result = exec_in_pod(pod_name, ["bash", "-c", build], timeout=600, use_debug=False)
+    if result.returncode == 0 and "XCCL_BUILD_OK" in (result.stdout or ""):
+        _out(f"  oneCCL benchmark built on {pod_name}.")
+        return True
+    _out(f"  Error: failed to build oneCCL benchmark on {pod_name}: "
+         f"{(result.stderr or result.stdout or '')[-300:]}")
+    return False
+
+
+def _parse_xccl_csv(pod_name, csv_path, total_gpus, sizes):
+    """Fetch the oneCCL benchmark CSV from *pod_name* and return parsed rows.
+
+    CSV columns (see oneCCL examples/benchmark):
+      #ranks,collective,reduction,dtype,dtype_size,#elements/buffer,
+      message_size,#buffers,#repetitions,t_min,t_max,t_avg,stddev,
+      wait_t_avg,algbw[GB/s],busbw[GB/s]
+    """
+    result = exec_in_pod(pod_name, ["cat", csv_path], timeout=30, use_debug=False)
+    if result.returncode != 0 or not (result.stdout or "").strip():
+        print(f"  Error: no XCCL CSV from this run on {pod_name}: {result.stderr or ''}")
+        return None
+    rows = []
+    for cols in csv.reader(result.stdout.strip().splitlines()):
+        if not cols or cols[0].startswith("#"):
+            continue
+        try:
+            if len(cols) != 16 or [v.strip() for v in cols[1:5]] != [
+                    "allreduce", "sum", "float32", "4"]:
+                raise ValueError("unexpected collective, datatype or CSV columns")
+            row = {
+                "world": int(cols[0]),
+                "size": int(cols[6]),
+                "count": int(cols[5]),
+                "time_us": float(cols[11]),
+                "algbw_gbs": float(cols[14]),
+                "busbw_gbs": float(cols[15]),
+            }
+            if row["world"] != total_gpus:
+                raise ValueError(f"expected {total_gpus} ranks, got {row['world']}")
+            if int(cols[5]) * 4 != row["size"]:
+                raise ValueError("invalid message size")
+            if int(cols[7]) != 1 or int(cols[8]) != int(AR_ITERS):
+                raise ValueError(f"expected one buffer and {AR_ITERS} repetitions")
+            if any(not math.isfinite(row[k]) or row[k] < 0
+                   for k in ("time_us", "algbw_gbs", "busbw_gbs")):
+                raise ValueError("invalid timing or bandwidth")
+            rows.append(row)
+        except (ValueError, IndexError) as exc:
+            print(f"  Error: invalid XCCL CSV: {exc}")
+            return None
+    if sorted(row["size"] for row in rows) != sorted(sizes):
+        print("  Error: XCCL CSV does not contain exactly the requested message sizes.")
+        return None
+    return rows
+
+
+def _env_values(pod_name, names):
+    """Return {name: value} for the names that are set in the pod env."""
+    if not names:
+        return {}
+    result = exec_in_pod(pod_name, ["env"], timeout=15, use_debug=False)
+    if result.returncode != 0:
+        raise RuntimeError(f"could not read environment on {pod_name}: {result.stderr}")
+    vals = {}
+    for line in result.stdout.splitlines():
+        key, _, value = line.partition("=")
+        if key in names and value:
+            vals[key] = value
+    return vals
+
+
+def _ensure_hosts_entries(group_pods):
+    """Make pod hostnames resolvable by Intel MPI Hydra's remote proxies."""
+    for name, _ip in group_pods:
+        cmds = []
+        for peer_name, peer_ip in group_pods:
+            if peer_name == name:
+                continue
+            cmds.append(
+                f"grep -qE '[[:space:]]{peer_name}$' /etc/hosts || "
+                f"echo '{peer_ip} {peer_name}' >> /etc/hosts"
+            )
+        if cmds:
+            result = exec_in_pod(name, ["bash", "-c", " && ".join(
+                f"({cmd})" for cmd in cmds)], timeout=15, use_debug=False)
+            if result.returncode != 0:
+                raise RuntimeError(f"could not configure MPI hostnames on {name}: {result.stderr}")
 
 
 # ---------------------------------------------------------------------------
 # GPU vendor detection (reuses run-tests-discovery.py)
 # ---------------------------------------------------------------------------
 def detect_gpu_vendor(pod_name):
-    """Detect GPU vendor on a pod: 'nvidia', 'amd', or 'unknown'."""
+    """Detect GPU vendor on a pod: 'nvidia', 'amd', 'xpu', or 'unknown'."""
     return _get_discovery()._detect_gpu_vendor(pod_name)
 
 
 def detect_all_gpu_vendors(pods):
     """Detect GPU vendor for all pods in parallel.
 
-    Returns dict: {pod_name: 'nvidia'|'amd'|'unknown'}
+    Returns dict: {pod_name: 'nvidia'|'amd'|'xpu'|'unknown'}
     """
     _c = _get_common()
     vendors = {}
@@ -135,6 +289,14 @@ def detect_gpu_count(pod_name, vendor):
     elif vendor == "amd":
         result = exec_in_pod(pod_name, ["bash", "-c", "rocm-smi --showid 2>/dev/null | grep -c GPU || echo 0"],
                              timeout=15, use_debug=False)
+    elif vendor == "xpu":
+        result = exec_in_pod(
+            pod_name,
+            ["bash", "-c",
+             "python3 -c 'import torch; print(torch.xpu.device_count())' 2>/dev/null "
+             "|| xpu-smi discovery -j 2>/dev/null | grep -o '\"device_id\"' | wc -l"],
+            timeout=90, use_debug=False,
+        )
     else:
         return 0
     if result.returncode == 0:
@@ -385,6 +547,8 @@ def ensure_collective_tests(pod_name, vendor, out=None):
             return False
         _out(f"  rccl-tests not found on {pod_name}, building ...")
         return build_rccl_tests(pod_name, out=_out)
+    elif vendor == "xpu":
+        return ensure_xccl_bench(pod_name, out=_out)
     else:
         _out(f"  Skipping {pod_name}: unknown GPU vendor.")
         return False
@@ -765,6 +929,8 @@ def run_all_reduce(group_pods, vendor, display_names, gpu_count,
     """
     if not group_pods:
         return None
+    if vendor == "xpu":
+        return _run_xpu_all_reduce(group_pods, display_names, gpu_count, mpirun_path)
 
     first_pod = group_pods[0][0]
     n_pods = len(group_pods)
@@ -821,7 +987,8 @@ def run_all_reduce(group_pods, vendor, display_names, gpu_count,
         f"--mca btl_tcp_if_include eth0 "
         f"--mca oob_tcp_if_include eth0 "
         f"--mca plm_rsh_args '-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null{' -i ' + key_path if key_path else ''}' "
-        f"{binary} -b {AR_MIN_BYTES} -e {AR_MAX_BYTES} -f {AR_FACTOR} -g {AR_GPUS_PER_PROC}"
+        f"{binary} -b {AR_MIN_BYTES} -e {AR_MAX_BYTES} -f {AR_FACTOR} -g {AR_GPUS_PER_PROC} "
+        f"-d float -o sum -n {AR_ITERS} -w {AR_WARMUP_ITERS} -c 1 -a 1"
     )
 
     vendor_label = "NCCL" if vendor == "nvidia" else "RCCL"
@@ -868,9 +1035,10 @@ def run_all_reduce(group_pods, vendor, display_names, gpu_count,
 
 
 def print_all_reduce_results(rows, vendor, n_pods, total_gpus):
-    """Print all_reduce_perf results as a formatted table."""
-    vendor_label = "NCCL" if vendor == "nvidia" else "RCCL"
-    print(f"\n  {vendor_label} all_reduce_perf ({n_pods} {vendor.upper()} pods, "
+    """Print collective results as a formatted table."""
+    vendor_label = {"nvidia": "NCCL", "amd": "RCCL", "xpu": "XCCL"}[vendor]
+    benchmark = "allreduce" if vendor == "xpu" else "all_reduce_perf"
+    print(f"\n  {vendor_label} {benchmark} ({n_pods} {vendor.upper()} pods, "
           f"{total_gpus} GPUs total):")
     print(f"  {'Size':>10s}  {'Count':>12s}  {'Time(us)':>12s}  "
           f"{'AlgBW(GB/s)':>12s}  {'BusBW(GB/s)':>12s}")
@@ -881,48 +1049,115 @@ def print_all_reduce_results(rows, vendor, n_pods, total_gpus):
               f"{r['algbw_gbs']:>12.2f}  {r['busbw_gbs']:>12.2f}")
 
 
+def _run_xpu_all_reduce(group_pods, display_names, gpu_count, mpirun_path):
+    """Run oneCCL using the same size range and result format as NCCL/RCCL."""
+    _c = _get_common()
+    first_pod = group_pods[0][0]
+    n_pods = len(group_pods)
+    total_gpus = n_pods * gpu_count
+    sizes = []
+    size = _c._parse_size(AR_MIN_BYTES)
+    while size <= _c._parse_size(AR_MAX_BYTES):
+        sizes.append(size)
+        size *= int(AR_FACTOR)
+
+    # Keep PATH/LD_LIBRARY_PATH local to the oneAPI installation of each rank.
+    forward_names = ["ONEAPI_DEVICE_SELECTOR",
+                     "ZE_AFFINITY_MASK", "ZE_FLAT_DEVICE_HIERARCHY", "SYCL_DEVICE_FILTER",
+                     "CCL_ATL_TRANSPORT", "CCL_KVS", "CCL_WORKER_COUNT",
+                     "CCL_PROCESS_LAUNCHER", "I_MPI_FABRICS",
+                     "I_MPI_HYDRA_BOOTSTRAP", "FI_PROVIDER",
+                     "UCX_TLS", "UCX_NET_DEVICES", "IPEX_VERBOSE"]
+    csv_path = f"{XCCL_BENCH_DIR}/result-{uuid.uuid4().hex}.csv"
+    try:
+        _ensure_hosts_entries(group_pods)
+        vals = _env_values(first_pod, forward_names)
+        vals.setdefault("I_MPI_FABRICS", "shm:ofi")
+        vals.setdefault("CCL_ATL_TRANSPORT", "ofi")
+        vals.setdefault("FI_PROVIDER", "tcp")
+        args = [mpirun_path, "-n", str(total_gpus), "-ppn", str(gpu_count),
+                "-hosts", ",".join(ip for _name, ip in group_pods)]
+        for key, value in vals.items():
+            args.extend(["-genv", f"{key}={value}"])
+        bench_args = [
+            XCCL_BENCH_BINARY, "--coll", "allreduce", "--backend", "sycl",
+            "--sycl_dev_type", "gpu", "--sycl_root_dev", "1",
+            "--sycl_mem_type", "usm", "--sycl_usm_type", "device",
+            "--sycl_queue_type", "in_order", "--inplace", "0", "--buf_count", "1",
+            "--dtype", "float32", "--reduction", "sum", "--check", "last",
+            "--iters", AR_ITERS, "--warmup_iters", AR_WARMUP_ITERS, "--iter_policy", "off",
+            "--elem_counts", ",".join(str(size // 4) for size in sizes),
+            "--csv_filepath", csv_path,
+        ]
+        args.extend(["bash", "-c", _ONEAPI_ENV + "exec " + shlex.join(bench_args)])
+        mpi_cmd = _ONEAPI_ENV + "exec " + shlex.join(args)
+        pod_names = ", ".join(display_names.get(name, name) for name, _ in group_pods)
+        print(f"\n  Running oneCCL/XCCL all_reduce across {n_pods} pod(s): {pod_names}")
+        print(f"  libfabric provider: {vals['FI_PROVIDER']}")
+        if _c.VERBOSE:
+            print(f"  $ {mpi_cmd}")
+        result = exec_in_pod(first_pod, ["bash", "-c", mpi_cmd], timeout=900, use_debug=False)
+        if _c.VERBOSE and result.stdout:
+            print(f"\n  Raw output:\n{result.stdout}")
+        if result.returncode != 0:
+            print(f"  XCCL all_reduce FAILED (exit {result.returncode}); "
+                  "CSV data from failed runs is not accepted.")
+            print(f"  stderr (last 1000 chars): {(result.stderr or '')[-1000:]}")
+            print(f"  stdout (last 1000 chars): {(result.stdout or '')[-1000:]}")
+            return None
+        return _parse_xccl_csv(first_pod, csv_path, total_gpus, sizes)
+    except subprocess.TimeoutExpired:
+        print("  XCCL all_reduce TIMED OUT after 900s")
+        return None
+    except RuntimeError as exc:
+        print(f"  Error: XCCL setup failed: {exc}")
+        return None
+    finally:
+        cleanup = exec_in_pod(first_pod, ["rm", "-f", csv_path], timeout=15, use_debug=False)
+        if cleanup.returncode != 0:
+            print(f"  Warning: could not remove XCCL result {csv_path}: {cleanup.stderr}")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 def run_nccl_rccl(pods, display_names):
-    """Run NCCL/RCCL all_reduce_perf tests.
+    """Run CCL collective tests (NCCL/RCCL/XCCL all_reduce).
 
     1. Detect GPU vendor per pod (parallel)
-    2. Group by vendor
-    3. Ensure tests built (parallel per group)
+    2. Group by vendor (nvidia/amd/xpu)
+    3. Ensure tests built / benchmark staged per group
     4. Setup SSH, run all_reduce, teardown SSH
     5. Return results dict
     """
     _c = _get_common()
 
     print(f"\n{'=' * 60}")
-    print("  NCCL/RCCL COLLECTIVE TESTS (all_reduce_perf)")
+    print("  COLLECTIVE TESTS — NCCL/RCCL/XCCL (all_reduce)")
     print(f"{'=' * 60}")
 
     # Step 1: Detect GPU vendors
     print("\nDetecting GPU vendors on all pods ...")
     vendors = detect_all_gpu_vendors(pods)
 
-    # Group pods by vendor
-    nvidia_pods = [(name, ip) for name, ip in pods if vendors.get(name) == "nvidia"]
-    amd_pods = [(name, ip) for name, ip in pods if vendors.get(name) == "amd"]
-    unknown_pods = [(name, ip) for name, ip in pods if vendors.get(name) not in ("nvidia", "amd")]
+    unknown_pods = [(name, ip) for name, ip in pods
+                    if vendors.get(name) not in ("nvidia", "amd", "xpu")]
 
     if unknown_pods:
         print(f"\n  Skipping {len(unknown_pods)} pod(s) with unknown GPU vendor: "
               f"{', '.join(display_names.get(n, n) for n, _ in unknown_pods)}")
 
-    if not nvidia_pods and not amd_pods:
-        print("\n  No pods with recognized GPUs found. Skipping NCCL/RCCL tests.")
+    if len(unknown_pods) == len(pods):
+        print("\n  No pods with recognized GPUs found. Skipping collective tests.")
         return {}
 
     all_results = {}
 
-    for vendor, group_pods in [("nvidia", nvidia_pods), ("amd", amd_pods)]:
+    for vendor, vendor_label in [("nvidia", "NCCL"), ("amd", "RCCL"), ("xpu", "XCCL")]:
+        group_pods = [(name, ip) for name, ip in pods if vendors.get(name) == vendor]
         if not group_pods:
             continue
 
-        vendor_label = "NCCL" if vendor == "nvidia" else "RCCL"
         print(f"\n{'─' * 50}")
         print(f"  {vendor_label} tests — {len(group_pods)} {vendor.upper()} pods")
         print(f"{'─' * 50}")
@@ -975,7 +1210,7 @@ def run_nccl_rccl(pods, display_names):
         # Step A: Install build deps (git, make, gcc, openmpi-devel) on all pods.
         # This must happen BEFORE building nccl/rccl-tests because `make MPI=1`
         # needs MPI headers at compile time.
-        if _c.INSTALL_DEPS:
+        if _c.INSTALL_DEPS and vendor != "xpu":
             print(f"\n  Installing build dependencies (git, make, gcc, OpenMPI) ...")
             dep_bufs = [_c._StreamingBuffer() for _ in range(n)]
             dep_done = [threading.Event() for _ in range(n)]
@@ -1007,7 +1242,7 @@ def run_nccl_rccl(pods, display_names):
             for t in dep_threads:
                 t.join(timeout=5)
 
-        # Step B: Ensure nccl/rccl-tests are built (parallel)
+        # Step B: Build the vendor's benchmark in parallel.
         print(f"\n  Ensuring {vendor_label.lower()}-tests are available ...")
         bufs = [_c._StreamingBuffer() for _ in range(n)]
         done_events = [threading.Event() for _ in range(n)]
@@ -1053,15 +1288,21 @@ def run_nccl_rccl(pods, display_names):
         # The system NCCL at /lib64/ may be compiled for a newer CUDA
         # (e.g., 2.29.7+cuda13.2) than the driver supports. The pip
         # nvidia-nccl package is typically matched to the container's CUDA.
-        _, nccl_lib_path = _find_nccl_paths(group_pods[0][0])
+        nccl_lib_path = None
+        if vendor != "xpu":
+            _, nccl_lib_path = _find_nccl_paths(group_pods[0][0])
         if nccl_lib_path and nccl_lib_path != "/usr/lib64":
             print(f"  Using pip NCCL lib: {nccl_lib_path}")
 
         # Step C: Find mpirun path (already installed by build deps above)
-        mpirun_path = find_mpirun(group_pods[0][0])
-        if not mpirun_path:
-            # Last resort: try install_mpi which searches harder
-            mpirun_path = install_mpi(group_pods[0][0])
+        if vendor == "xpu":
+            mpi_paths = {name: find_intel_mpirun(name) for name, _ip in group_pods}
+            if not all(mpi_paths.values()) or len(set(mpi_paths.values())) != 1:
+                print(f"  Error: matching Intel MPI is required on all pods: {mpi_paths}")
+                continue
+            mpirun_path = mpi_paths[group_pods[0][0]]
+        else:
+            mpirun_path = find_mpirun(group_pods[0][0]) or install_mpi(group_pods[0][0])
         if not mpirun_path:
             print(f"  Error: mpirun not available on {group_pods[0][0]}. "
                   f"Skipping {vendor_label} tests.")
@@ -1076,11 +1317,14 @@ def run_nccl_rccl(pods, display_names):
         else:
             ssh_ok, key_path = ssh_result, None
         ssh_dir = str(key_path).rsplit("/", 1)[0] if key_path else None
-        if not ssh_ok:
+        if not ssh_ok and vendor != "xpu":
             print(f"  Warning: SSH setup incomplete. Attempting to run anyway ...")
 
         # Run all_reduce_perf
         try:
+            if not ssh_ok and vendor == "xpu":
+                print("  Error: SSH setup incomplete. Skipping XCCL tests.")
+                continue
             rows = run_all_reduce(group_pods, vendor, display_names, gpu_count,
                                   mpirun_path=mpirun_path, key_path=key_path,
                                   nccl_lib_path=nccl_lib_path)
@@ -1103,27 +1347,28 @@ def run_nccl_rccl(pods, display_names):
 
 
 # ---------------------------------------------------------------------------
-# Standalone entry point — allows:  uv run run-tests-nccl-rccl.py [options]
+# Standalone entry point — allows:  uv run run-tests-ccl.py [options]
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
     _USAGE = """\
-Usage: uv run run-tests-nccl-rccl.py [options]
+Usage: uv run run-tests-ccl.py [options]
 
-Run NCCL/RCCL all_reduce_perf collective tests between Kubernetes
-inference pods.
+Run CCL collective tests (NCCL / RCCL / XCCL) between Kubernetes inference
+pods.
 
-Equivalent to: run-tests.sh -t nccl-rccl
+Equivalent to: run-tests.sh -t ccl (alias: nccl-rccl)
 
-Detects GPU vendor per pod (NVIDIA/AMD), builds nccl-tests or rccl-tests
-from source if needed, sets up passwordless SSH for mpirun, runs
-all_reduce_perf, and displays results.
+Detects GPU vendor per pod (NVIDIA/AMD/Intel XPU).  Builds nccl-tests or
+rccl-tests from source if needed for NVIDIA/AMD; builds and runs the oneCCL
+`benchmark` binary for Intel XPU.  Sets up passwordless SSH for mpirun in all
+cases.
 
 Options:
   -D, --debug-image IMAGE
                         Use ephemeral debug containers with the given image.
   -e, --explain         Show the kubectl/shell commands behind each finding.
   -h, --help            Show this help message.
-  -i, --install-deps    Build nccl-tests/rccl-tests from source if missing.
+  -i, --install-deps    Build the vendor's collective benchmark if missing.
   -l, --label SELECTOR  Label selector to discover pods
                         (default: "llm-d.ai/inferenceServing=true").
   -n, --namespace NS    Kubernetes namespace for all kubectl commands.

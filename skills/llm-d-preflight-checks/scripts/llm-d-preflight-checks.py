@@ -59,17 +59,46 @@ def gather_info():
 
     has_nvidia_smi = shutil.which("nvidia-smi") is not None
     has_rocm_smi = shutil.which("rocm-smi") is not None
+    has_amd_smi = shutil.which("amd-smi") is not None
+    has_xpu_smi = shutil.which("xpu-smi") is not None
+    has_sycl_ls = shutil.which("sycl-ls") is not None
+
+    gpu_tools_found = False
 
     if has_nvidia_smi:
+        gpu_tools_found = True
         sections["nvidia-smi"] = run_cmd("nvidia-smi")
         sections["nvidia-smi topo -m"] = run_cmd("nvidia-smi topo -m")
         sections["nvidia-smi nvlink --status"] = run_cmd("nvidia-smi nvlink --status")
-    elif has_rocm_smi:
+
+    if has_rocm_smi:
+        gpu_tools_found = True
         sections["rocm-smi"] = run_cmd("rocm-smi")
         sections["rocm-smi --showtopo"] = run_cmd("rocm-smi --showtopo")
         sections["rocm-smi --showbus"] = run_cmd("rocm-smi --showbus")
-    else:
-        sections["gpu"] = "(neither nvidia-smi nor rocm-smi found)"
+
+    if has_amd_smi:
+        gpu_tools_found = True
+        sections["amd-smi"] = run_cmd("amd-smi")
+        sections["amd-smi topology"] = run_cmd("amd-smi topology")
+
+    # Intel XPU (Data Center GPU / Arc Pro): management tool plus the
+    # Level Zero topology / P2P / fabric-health views it provides.
+    if has_xpu_smi:
+        gpu_tools_found = True
+        sections["xpu-smi discovery"] = run_cmd("xpu-smi discovery")
+        sections["xpu-smi topology -m"] = run_cmd("xpu-smi topology -m")
+        sections["xpu-smi topology --p2p r"] = run_cmd("xpu-smi topology --p2p r")
+        sections["xpu-smi health -l"] = run_cmd("xpu-smi health -l")
+
+    # SYCL device enumeration is useful even without xpu-smi (shows whether
+    # an Intel Level Zero GPU is visible to the runtime).
+    if has_sycl_ls:
+        sections["sycl-ls"] = run_cmd("sycl-ls")
+
+    if not gpu_tools_found and not has_sycl_ls:
+        sections["gpu"] = ("(no recognized GPU management tool found: "
+                           "nvidia-smi, rocm-smi, amd-smi, xpu-smi, sycl-ls)")
 
     if shutil.which("lscpu"):
         sections["lscpu"] = run_cmd("lscpu")

@@ -3,14 +3,17 @@
 # ///
 """GPU topology discovery for Kubernetes inference pods.
 
-Extracted from run-tests.py — validates GPU topology, NVLink/NVSwitch,
+Extracted from run-tests.py — validates GPU topology, high-bandwidth
+fabric (NVLink/NVSwitch, AMD xGMI/Infinity Fabric, Intel XPU Xe Link/MDF),
 NUMA affinity, PCIe layout, RDMA NIC status, and environment variables
-(NCCL, UCX, vLLM, CUDA, PyTorch distributed, NIXL) across pods.
+(NCCL, UCX, oneAPI/Level Zero, vLLM, CUDA, PyTorch distributed, NIXL)
+across pods.
 
 Public API:
     run_topology_validation(pods, display_names) -> dict
 """
 
+import json
 import re
 import sys
 import threading
@@ -63,19 +66,70 @@ def _strip_ansi(text):
 _amd_tool_cache = {}  # pod_name -> str
 
 
+# ---------------------------------------------------------------------------
+# Vendor-agnostic interconnect classification
+# ---------------------------------------------------------------------------
+# High-bandwidth GPU interconnect tokens:
+#   NVIDIA: NV## (e.g. NV18) / NVL
+#   AMD:    XGMI (Infinity Fabric)
+#   Intel:  MDF (Multi-Die Fabric Interface — tile/fabric links) and, where
+#           the XPU tooling reports it explicitly, XE/XL (Xe Link).
+_FABRIC_EXACT = {"NVL", "XGMI", "MDF", "XE", "XL", "XELINK"}
+_PCIE_ONLY_TYPES = {"PIX", "PXB", "PHB", "NODE", "SYS"}
+
+# Intel Markers used to recognise XPU lines in `lspci` output.
+_INTEL_GPU_HINTS = (
+    "graphics controller", "display controller", "processing accelerators",
+    "vpu", "data center gpu",
+)
+
+
+def _is_fabric(conn):
+    """True if a topology connection token is a high-bandwidth GPU fabric."""
+    if not conn:
+        return False
+    return conn.startswith("NV") or conn in _FABRIC_EXACT
+
+
+def _fabric_label(vendor):
+    """Human-readable name of the GPU fabric for a vendor."""
+    return {
+        "nvidia": "NVLink/NVSwitch",
+        "amd": "xGMI/Infinity Fabric",
+        "xpu": "Xe Link/MDF fabric",
+    }.get(vendor, "high-bandwidth fabric")
+
+
+def _is_intel_gpu_line(line_lower):
+    """True if a lowercased `lspci` line looks like an Intel GPU/accelerator."""
+    return "intel" in line_lower and any(h in line_lower for h in _INTEL_GPU_HINTS)
+
+
+def _vendor_topo_cmd(vendor):
+    """The topology command used for a vendor (for explain/report text)."""
+    return {
+        "nvidia": "nvidia-smi topo -m",
+        "amd": "rocm-smi --showtopo",
+        "xpu": "xpu-smi topology -m",
+    }.get(vendor, "GPU topology")
+
+
 def _get_amd_tool(pod_name):
     """Return the AMD GPU tool name for a pod (default: 'rocm-smi')."""
     return _amd_tool_cache.get(pod_name, "rocm-smi")
 
 
 def _detect_gpu_vendor(pod_name):
-    """Detect GPU vendor on a pod: 'nvidia', 'amd', or 'unknown'.
+    """Detect GPU vendor on a pod: 'nvidia', 'amd', 'xpu', or 'unknown'.
 
-    Tries nvidia-smi first, then rocm-smi, then amd-smi.
+    Tries nvidia-smi, rocm-smi, amd-smi, then xpu-smi.  When xpu-smi is
+    absent but an Intel GPU is present, falls back to sycl-ls then lspci
+    (containers often ship only the Level Zero/SYCL runtime).
     """
     result = exec_in_pod(pod_name, ["bash", "-c", "command -v nvidia-smi >/dev/null 2>&1 && echo nvidia; "
                                      "command -v rocm-smi >/dev/null 2>&1 && echo rocm-smi; "
-                                     "command -v amd-smi >/dev/null 2>&1 && echo amd-smi; true"],
+                                     "command -v amd-smi >/dev/null 2>&1 && echo amd-smi; "
+                                     "command -v xpu-smi >/dev/null 2>&1 && echo xpu-smi; true"],
                          timeout=10, use_debug=False)
     if result.returncode == 0:
         out = result.stdout.strip().lower()
@@ -87,6 +141,24 @@ def _detect_gpu_vendor(pod_name):
         if "amd-smi" in out:
             _amd_tool_cache[pod_name] = "amd-smi"
             return "amd"
+        if "xpu-smi" in out:
+            return "xpu"
+
+    # Fallback 1: sycl-ls listing an Intel Level Zero GPU.
+    result = exec_in_pod(pod_name, ["bash", "-c",
+                                     "command -v sycl-ls >/dev/null 2>&1 && "
+                                     "sycl-ls 2>/dev/null | grep -iE 'level_zero.*intel|intel.*level_zero'; true"],
+                         timeout=15, use_debug=False)
+    if result.returncode == 0 and result.stdout.strip():
+        return "xpu"
+
+    # Fallback 2: Intel GPU/accelerator visible on the PCI bus.
+    result = exec_in_pod(pod_name, ["bash", "-c",
+                                     "lspci 2>/dev/null | grep -iE "
+                                     "'intel.*(graphics controller|display controller|processing accelerators|data center gpu)'; true"],
+                         timeout=15, use_debug=False)
+    if result.returncode == 0 and result.stdout.strip():
+        return "xpu"
     return "unknown"
 
 
@@ -95,6 +167,7 @@ def _get_gpu_topo(pod_name, vendor):
 
     nvidia: nvidia-smi topo -m
     amd:    rocm-smi --showtopo / amd-smi topology
+    xpu:    xpu-smi topology -m (CPU/GPU interconnect matrix)
     """
     if vendor == "nvidia":
         result = exec_in_pod(pod_name, ["nvidia-smi", "topo", "-m"], timeout=30, use_debug=False)
@@ -103,6 +176,8 @@ def _get_gpu_topo(pod_name, vendor):
             result = exec_in_pod(pod_name, ["amd-smi", "topology"], timeout=30, use_debug=False)
         else:
             result = exec_in_pod(pod_name, ["rocm-smi", "--showtopo"], timeout=30, use_debug=False)
+    elif vendor == "xpu":
+        result = exec_in_pod(pod_name, ["xpu-smi", "topology", "-m"], timeout=30, use_debug=False)
     else:
         return None, False
     if result.returncode != 0:
@@ -115,6 +190,8 @@ def _get_gpu_link_status(pod_name, vendor):
 
     nvidia: nvidia-smi nvlink --status
     amd:    rocm-smi --showtopoweight / amd-smi topology --weight (xGMI/Infinity Fabric link weights)
+    xpu:    xpu-smi topology --p2p r (P2P read/write capability matrix:
+            OK = supported, NS = not supported, ? = query failed)
     """
     if vendor == "nvidia":
         result = exec_in_pod(pod_name, ["nvidia-smi", "nvlink", "--status"], timeout=30, use_debug=False)
@@ -123,6 +200,8 @@ def _get_gpu_link_status(pod_name, vendor):
             result = exec_in_pod(pod_name, ["amd-smi", "topology", "--weight"], timeout=30, use_debug=False)
         else:
             result = exec_in_pod(pod_name, ["rocm-smi", "--showtopoweight"], timeout=30, use_debug=False)
+    elif vendor == "xpu":
+        result = exec_in_pod(pod_name, ["xpu-smi", "topology", "--p2p", "r"], timeout=30, use_debug=False)
     else:
         return None, False
     if result.returncode != 0:
@@ -135,6 +214,7 @@ def _get_gpu_bus_ids(pod_name, vendor):
 
     nvidia: nvidia-smi --query-gpu=index,gpu_bus_id --format=csv,noheader
     amd:    rocm-smi --showbus / amd-smi static --bus (parse GPU ID and bus ID)
+    xpu:    xpu-smi discovery (JSON preferred, text fallback; parse PCI BDF)
     """
     pairs = []
     if vendor == "nvidia":
@@ -177,7 +257,101 @@ def _get_gpu_bus_ids(pod_name, vendor):
                     m = re.match(r'.*GPU:\s*(\d+).*BUS:\s*([0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.\d)', line, re.IGNORECASE)
                 if m:
                     pairs.append((int(m.group(1)), m.group(2).lower()))
+    elif vendor == "xpu":
+        pairs = _get_xpu_bus_ids(pod_name)
     return pairs
+
+
+def _xpu_pairs_from_json(data):
+    """Extract (index, pci_bdf) pairs from parsed `xpu-smi discovery -j` JSON.
+
+    The JSON schema varies between XPU Manager versions, so this walks the
+    structure tolerantly: for each device object it looks for a decimal
+    device index and a string containing a PCI BDF address.
+    """
+    if isinstance(data, dict):
+        items = (data.get("devices") or data.get("device_list")
+                 or data.get("data") or [data])
+    elif isinstance(data, list):
+        items = data
+    else:
+        return []
+
+    bdf_re = re.compile(r'[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]')
+    pairs = []
+    for pos, item in enumerate(items):
+        if not isinstance(item, dict):
+            continue
+        idx = None
+        bus = None
+        for key, val in item.items():
+            if not isinstance(val, (str, int)):
+                continue
+            kl = key.lower()
+            sval = str(val)
+            m = bdf_re.search(sval)
+            if m and ("bdf" in kl or "pci" in kl or "bus" in kl):
+                bus = m.group(0).lower()
+            elif idx is None and sval.strip().isdigit() and (
+                    "device_id" in kl or "device id" in kl or kl in ("id", "deviceindex", "device_index")):
+                idx = int(sval.strip())
+        if bus is not None:
+            pairs.append((idx if idx is not None else pos, bus))
+    pairs.sort(key=lambda x: x[0])
+    return pairs
+
+
+def _xpu_pairs_from_text(text):
+    """Extract (index, pci_bdf) pairs from plain `xpu-smi discovery` text."""
+    bdf_re = r'[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]'
+    pairs = []
+    cur_idx = None
+    for line in text.split("\n"):
+        # "PCI BDF Address: 0000:03:00.0" (per-device section)
+        m = re.search(r'PCI BDF Address:\s*(' + bdf_re + ')', line)
+        if m:
+            pairs.append((cur_idx if cur_idx is not None else len(pairs), m.group(1).lower()))
+            continue
+        # Default table row: "| 0 | ..."
+        id_m = re.search(r'\|\s*(\d+)\s*\|', line)
+        if id_m:
+            cur_idx = int(id_m.group(1))
+            continue
+        # Flat row: "0  0000:03:00.0 ..."
+        m = re.match(r'\s*(\d+)\s+.*?(' + bdf_re + ')', line)
+        if m:
+            pairs.append((int(m.group(1)), m.group(2).lower()))
+    # De-duplicate while preserving first occurrence
+    seen = set()
+    unique = []
+    for idx, bus in pairs:
+        if (idx, bus) in seen:
+            continue
+        seen.add((idx, bus))
+        unique.append((idx, bus))
+    unique.sort(key=lambda x: x[0])
+    return unique
+
+
+def _get_xpu_bus_ids(pod_name):
+    """Get XPU (index, PCI bus ID) pairs via xpu-smi discovery."""
+    result = exec_in_pod(pod_name, ["bash", "-c", "xpu-smi discovery -j 2>/dev/null"],
+                         timeout=20, use_debug=False)
+    if result.returncode == 0 and result.stdout.strip():
+        try:
+            data = json.loads(result.stdout)
+        except (ValueError, TypeError):
+            data = None
+        if data is not None:
+            pairs = _xpu_pairs_from_json(data)
+            if pairs:
+                return pairs
+
+    result = exec_in_pod(pod_name, ["bash", "-c", "xpu-smi discovery 2>/dev/null"],
+                         timeout=20, use_debug=False)
+    if result.returncode == 0 and result.stdout.strip():
+        return _xpu_pairs_from_text(_strip_ansi(result.stdout))
+    return []
 
 
 def _parse_rocm_topo(output):
@@ -292,6 +466,125 @@ def _parse_rocm_link_status(output):
     return active, inactive
 
 
+# Label tokens used by xpu-smi topology in different XPU Manager versions:
+#   GPU0 / Device0 / device 0 / xe0 / 0
+_XPU_LABEL_RE = re.compile(r'^(?:GPU|Device|xe|XPU)?\s*(\d+)(/\d+)?$', re.IGNORECASE)
+# xpu-smi prints matrix labels as two tokens ("GPU 0", "GPU 0/0"); the
+# optional "/t" is the tile index within the physical device.
+_XPU_GPU_LABEL_RE = re.compile(r'\b(GPU|Device|xe|XPU)\s+(\d+(?:/\d+)?)', re.IGNORECASE)
+# Interconnect symbols used by xpu-smi topology -m and --p2p matrices.
+_XPU_SYMBOLS = {"S", "MDF", "XE", "XL", "XELINK", "PIX", "PXB", "PHB",
+                "NODE", "SYS", "X", "OK", "NS", "?"}
+
+
+def _normalize_xpu_output(text):
+    """Normalize spacing and table borders without discarding tile indices."""
+    if not text:
+        return text
+    text = _XPU_GPU_LABEL_RE.sub(lambda m: f"GPU{m.group(2)}", text)
+    return text.replace("|", " ").replace("│", " ")
+
+
+def _normalize_xpu_label(tok):
+    """Normalize an XPU device/tile label; return None for non-device tokens."""
+    m = _XPU_LABEL_RE.match(str(tok).strip())
+    if m:
+        return f"GPU{int(m.group(1))}{m.group(2) or ''}"
+    return None
+
+
+def _parse_generic_matrix(output):
+    """Parse a complete XPU matrix, preserving device/tile labels."""
+    lines = [ln for ln in _normalize_xpu_output(output).splitlines() if ln.strip()]
+    header_idx = None
+    header_labels = None
+    for i, ln in enumerate(lines):
+        toks = ln.split()
+        k = 0
+        for t in toks:
+            if _normalize_xpu_label(t) is not None:
+                k += 1
+            else:
+                break
+        if k >= 1 and (k == len(toks) or toks[k].upper() not in _XPU_SYMBOLS):
+            header_idx = i
+            header_labels = [_normalize_xpu_label(t) for t in toks[:k]]
+            break
+
+    if header_idx is None or len(set(header_labels)) != len(header_labels):
+        return {}, []
+
+    connections = {}
+    gpu_labels = []
+    for ln in lines[header_idx + 1:]:
+        toks = ln.split()
+        if len(toks) < 2:
+            continue
+        row_label = _normalize_xpu_label(toks[0])
+        if row_label not in header_labels:
+            continue
+        if row_label in gpu_labels:
+            return {}, []
+        gpu_labels.append(row_label)
+        vals = toks[1:]
+        for col_idx, col_label in enumerate(header_labels):
+            if col_idx >= len(vals):
+                return {}, []
+            val = vals[col_idx].upper()
+            if val not in _XPU_SYMBOLS:
+                return {}, []
+            connections[(row_label, col_label)] = val
+
+    if set(gpu_labels) != set(header_labels):
+        return {}, []
+    return connections, header_labels
+
+
+def _parse_xpu_topo(output):
+    """Aggregate tile topology into a conservative physical-device matrix."""
+    if not output:
+        return {}, []
+    tile_connections, tile_labels = _parse_generic_matrix(output)
+    gpu_labels = list(dict.fromkeys(label.split("/")[0] for label in tile_labels))
+    connections = {(gpu, gpu): "S" for gpu in gpu_labels}
+    severity = {"MDF": 0, "XE": 0, "XL": 0, "XELINK": 0,
+                "PIX": 1, "PXB": 2, "PHB": 3, "NODE": 3, "SYS": 4, "?": 5}
+    for (row, col), conn in tile_connections.items():
+        pair = (row.split("/")[0], col.split("/")[0])
+        if pair[0] == pair[1]:
+            continue
+        if conn not in severity:
+            return {}, []
+        # A device pair is only fabric-connected if all its tile paths are.
+        previous = connections.get(pair)
+        if previous is None or severity[conn] > severity[previous]:
+            connections[pair] = conn
+    return connections, gpu_labels
+
+
+def _parse_xpu_link_status(output):
+    """Parse `xpu-smi topology --p2p r` capability matrix.
+
+    Returns (active, inactive): count of OK (P2P supported) and NS/?
+    (not supported / query failed) cells between distinct devices.
+    """
+    if not output:
+        raise ValueError("empty XPU P2P matrix")
+    connections, labels = _parse_generic_matrix(output)
+    if not labels:
+        raise ValueError("could not parse XPU P2P matrix")
+    pairs = {}
+    for (row, col), val in connections.items():
+        pair = (row.split("/")[0], col.split("/")[0])
+        if pair[0] == pair[1]:
+            continue
+        if val not in ("OK", "NS", "?"):
+            raise ValueError(f"unexpected XPU P2P capability: {val}")
+        pairs[pair] = pairs.get(pair, True) and val == "OK"
+    active = sum(pairs.values())
+    return active, len(pairs) - active
+
+
 def _run_topo_cmd(pod_name, cmd_args, label):
     """Run a topology command on a pod and return (stdout, success)."""
     result = exec_in_pod(pod_name, cmd_args, timeout=30, use_debug=False)
@@ -380,33 +673,32 @@ def _parse_topo_matrix(output):
     return connections, gpu_labels
 
 
-def _check_nvlink_topology(connections, gpu_labels):
-    """Check if GPUs are connected via NVLink/NVSwitch/xGMI vs PCIe only.
+def _check_nvlink_topology(connections, gpu_labels, vendor="nvidia"):
+    """Check if GPUs are connected via a high-bandwidth fabric vs PCIe only.
 
-    Recognizes both NVIDIA (NV##, NVL) and AMD (XGMI) high-bandwidth links.
+    Recognizes NVIDIA (NV##, NVL), AMD (XGMI) and Intel XPU (MDF / Xe Link)
+    high-bandwidth links.
 
-    Returns (has_nvlink, summary_str).
+    Returns (has_fabric, summary_str).
     """
     if not connections or not gpu_labels:
         return False, "no topology data"
 
-    nvlink_pairs = []
+    fabric_pairs = []
     pcie_only_pairs = []
-    pcie_types = {"PIX", "PHB", "PXB", "SYS", "NODE"}
 
     for (g1, g2), conn in connections.items():
         if g1 == g2 or conn == "X":
             continue
         if g1 > g2:
             continue  # avoid counting pairs twice
-        # NVLink (NV#, NVL) or AMD xGMI — high-bandwidth GPU interconnect
-        if conn.startswith("NV") or conn == "NVL" or conn == "XGMI":
-            nvlink_pairs.append((g1, g2, conn))
-        elif conn in pcie_types:
+        if _is_fabric(conn):
+            fabric_pairs.append((g1, g2, conn))
+        elif conn in _PCIE_ONLY_TYPES:
             pcie_only_pairs.append((g1, g2, conn))
 
-    if nvlink_pairs:
-        return True, f"{len(nvlink_pairs)} GPU pair(s) connected via NVLink/NVSwitch"
+    if fabric_pairs:
+        return True, f"{len(fabric_pairs)} GPU pair(s) connected via {_fabric_label(vendor)}"
     elif pcie_only_pairs:
         return False, f"all {len(pcie_only_pairs)} GPU pair(s) connected via PCIe only"
     else:
@@ -430,8 +722,11 @@ def _check_hop_distance(connections, gpu_labels):
         return []
 
     # Severity ranking: lower is better.  Anything above the threshold warns.
-    SEVERITY = {"NV": 0, "NVL": 0, "XGMI": 0, "PIX": 1, "PXB": 2, "PHB": 3, "NODE": 3, "SYS": 4}
+    SEVERITY = {"NV": 0, "NVL": 0, "XGMI": 0, "MDF": 0, "XE": 0, "XL": 0, "XELINK": 0,
+                "PIX": 1, "PXB": 2, "PHB": 3, "NODE": 3, "SYS": 4}
     LABEL = {"NV": "NVLink", "NVL": "NVLink", "XGMI": "xGMI/Infinity Fabric",
+             "MDF": "Intel MDF/Xe Link (tile/fabric)",
+             "XE": "Xe Link", "XL": "Xe Link", "XELINK": "Xe Link",
              "PIX": "same PCIe switch",
              "PXB": "cross PCIe switch", "PHB": "cross PCIe root (same NUMA)",
              "NODE": "same NUMA node", "SYS": "cross-NUMA/cross-socket"}
@@ -439,10 +734,8 @@ def _check_hop_distance(connections, gpu_labels):
     WARN_THRESHOLD = 3
 
     def _conn_severity(conn):
-        if conn.startswith("NV"):
-            return 0, "NVLink"
-        if conn == "XGMI":
-            return 0, "xGMI/Infinity Fabric"
+        if _is_fabric(conn):
+            return 0, LABEL.get(conn, "Xe Link" if conn.startswith("X") else "NVLink")
         return SEVERITY.get(conn, 5), LABEL.get(conn, conn)
 
     warns = []
@@ -472,15 +765,15 @@ def _check_hop_distance(connections, gpu_labels):
     return warns
 
 
-def _check_nvswitch_domains(connections, gpu_labels):
-    """Detect whether GPUs belong to different NVSwitch domains.
+def _check_nvswitch_domains(connections, gpu_labels, vendor="nvidia"):
+    """Detect whether GPUs belong to different fabric domains.
 
-    When all GPUs are in the same NVSwitch domain, every GPU pair shows a
-    uniform NV## link count (e.g. NV18 everywhere).  If the NVLink width
-    varies significantly between pairs, GPUs are likely split across
-    separate NVSwitch domains — suboptimal for collective operations.
+    For NVIDIA this is the NVSwitch domain: when all GPUs are in the same
+    domain, every GPU pair shows a uniform NV## link count (e.g. NV18
+    everywhere).  The same "uniform vs split" logic applies to AMD xGMI
+    and Intel XPU Xe Link / MDF fabric domains.
 
-    Also detects a mixed topology where some GPU pairs use NVLink and
+    Also detects a mixed topology where some GPU pairs use the fabric and
     others fall back to PCIe, which is a clear domain split.
 
     Returns (is_uniform, warnings_list).
@@ -488,12 +781,13 @@ def _check_nvswitch_domains(connections, gpu_labels):
     if not connections or len(gpu_labels) < 2:
         return True, []
 
-    # Collect NVLink widths and PCIe-fallback pairs
-    nvlink_widths = {}   # (g1,g2) -> int  (the ## in NV##)
-    pcie_pairs = []      # pairs that use PCIe despite NVLink existing elsewhere
+    fabric_name = _fabric_label(vendor)
+    # Collect fabric widths and PCIe-fallback pairs
+    nvlink_widths = {}   # (g1,g2) -> int  (the ## in NV##; -1 if unnumbered)
+    pcie_pairs = []      # pairs that use PCIe despite the fabric existing elsewhere
     seen = set()
 
-    has_any_nvlink = False
+    has_any_fabric = False
     for (g1, g2), conn in connections.items():
         if g1 == g2 or conn == "X":
             continue
@@ -501,24 +795,24 @@ def _check_nvswitch_domains(connections, gpu_labels):
         if pair in seen:
             continue
         seen.add(pair)
-        if conn.startswith("NV") or conn == "XGMI":
-            has_any_nvlink = True
-            # Extract numeric width: NV18 -> 18, NVL/XGMI -> -1 (present but unnumbered)
+        if _is_fabric(conn):
+            has_any_fabric = True
+            # Extract numeric width: NV18 -> 18; NVL/XGMI/MDF -> -1
             if conn.startswith("NV"):
                 suffix = conn[2:]
                 width = int(suffix) if suffix.isdigit() else -1
             else:
-                width = -1  # XGMI — no lane count
+                width = -1
             nvlink_widths[pair] = width
         else:
             pcie_pairs.append((pair, conn))
 
-    if not has_any_nvlink:
-        return True, []  # no NVLink at all, nothing to check
+    if not has_any_fabric:
+        return True, []  # no fabric at all, nothing to check
 
     warns = []
 
-    # Check 1: Some pairs use NVLink, others fall back to PCIe
+    # Check 1: Some pairs use the fabric, others fall back to PCIe
     if pcie_pairs:
         fallback_strs = [f"{a}<->{b} ({conn})" for (a, b), conn in pcie_pairs]
         if len(fallback_strs) <= 4:
@@ -526,11 +820,11 @@ def _check_nvswitch_domains(connections, gpu_labels):
         else:
             detail = f"{len(fallback_strs)} pairs"
         warns.append(
-            f"NVSwitch domain split: {len(nvlink_widths)} pair(s) use NVLink but "
+            f"{fabric_name} domain split: {len(nvlink_widths)} pair(s) use the fabric but "
             f"{len(pcie_pairs)} pair(s) fall back to PCIe: {detail}"
         )
 
-    # Check 2: Non-uniform NVLink widths (e.g. some NV18, some NV12)
+    # Check 2: Non-uniform fabric widths (e.g. some NV18, some NV12)
     numeric_widths = [w for w in nvlink_widths.values() if w > 0]
     if numeric_widths:
         unique_widths = set(numeric_widths)
@@ -548,14 +842,18 @@ def _check_nvswitch_domains(connections, gpu_labels):
 
 
 def _fetch_nccl_env(pod_name):
-    """Fetch NCCL/RDMA/vLLM/CUDA/PyTorch/NIXL environment variables from a pod.
+    """Fetch accelerator/RDMA/vLLM/PyTorch/NIXL environment variables.
+
+    Covers NVIDIA (NCCL/CUDA), AMD (ROCm), and Intel XPU
+    (oneAPI/Level Zero/SYCL/oneCCL) variable families.
 
     Returns a dict of var_name -> value for all matching env vars.
     """
     # Grep for all inference-relevant env vars in one exec call
     script = (
         "env | grep -E "
-        "'^(NCCL_|RDMA_|UCX_|VLLM_|CUDA_|TORCH_|MASTER_|NIXL_|RANK=|WORLD_SIZE=|LOCAL_RANK=)' "
+        "'^(NCCL_|RDMA_|UCX_|VLLM_|CUDA_|TORCH_|MASTER_|NIXL_|RANK=|WORLD_SIZE=|LOCAL_RANK="
+        "|ONEAPI_|ZE_|SYCL_|CCL_|IPEX_|FI_|I_MPI_|OMPI_|INTEL_|XPU_)' "
         "| sort; true"
     )
     result = exec_in_pod(pod_name, ["bash", "-c", script], timeout=15, use_debug=False)
@@ -573,12 +871,13 @@ def _fetch_rdma_devices(pod_name):
 
     Returns a list of device names (e.g. ['mlx5_0', 'mlx5_1']).
     """
-    # Try ibv_devices first — provides authoritative list from libibverbs
-    # Filter out header lines (device, ------) keeping only actual device names
+    # Try ibv_devices first — authoritative list of devices usable by
+    # libibverbs in this container (sysfs may expose host-wide devices that
+    # are not allocated to the pod).  Portable parse: skip the two header
+    # lines (avoid awk '\s', unsupported by mawk).
     result = exec_in_pod(
         pod_name,
-        ["bash", "-c",
-         "ibv_devices 2>/dev/null | awk '/^\\s+/{print $1}' | grep -vE '^(-|device$)'; true"],
+        ["bash", "-c", "ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'; true"],
         timeout=15, use_debug=False,
     )
     if result.returncode == 0 and result.stdout.strip():
@@ -1372,6 +1671,135 @@ def _validate_vllm_cuda_env(env_vars, gpu_count, rdma_devices, has_nvlink):
     return findings, warns
 
 
+def _validate_xpu_env(env_vars, gpu_count, rdma_devices):
+    """Validate Intel XPU (oneAPI / Level Zero / SYCL / oneCCL) env vars.
+
+    Checks device selection, oneCCL/UCX transport, and vendor-mismatched
+    NVIDIA/AMD variables that silently have no effect on XPU hardware.
+
+    Returns (findings, warnings) where findings is a list of info strings
+    and warnings is a list of warning strings.
+    """
+    findings = []
+    warns = []
+
+    xpu_vars = {k: v for k, v in env_vars.items()
+                if k.startswith(("ONEAPI_", "ZE_", "SYCL_", "CCL_", "IPEX_", "XPU_"))}
+    if xpu_vars:
+        findings.append(f"XPU/oneAPI: {len(xpu_vars)} variable(s) set")
+
+    # --- VLLM_TARGET_DEVICE ---
+    target_dev = env_vars.get("VLLM_TARGET_DEVICE")
+    if target_dev is not None:
+        findings.append(f"VLLM_TARGET_DEVICE={target_dev}")
+        if target_dev.lower() != "xpu":
+            warns.append(
+                f"VLLM_TARGET_DEVICE={target_dev} on an Intel XPU pod — expected 'xpu'"
+            )
+
+    # --- ONEAPI_DEVICE_SELECTOR ---
+    selector = env_vars.get("ONEAPI_DEVICE_SELECTOR")
+    if selector is not None:
+        findings.append(f"ONEAPI_DEVICE_SELECTOR={selector}")
+        sel_l = selector.lower().strip()
+        if "level_zero" not in sel_l and not sel_l.startswith("*"):
+            warns.append(
+                f"ONEAPI_DEVICE_SELECTOR={selector} does not select the level_zero "
+                f"backend — Intel GPU devices may be invisible to SYCL/oneCCL"
+            )
+        sel_m = re.search(r'level_zero:\s*([0-9,\s]+)', selector)
+        if sel_m and gpu_count:
+            n = len([x for x in sel_m.group(1).split(",") if x.strip().isdigit()])
+            if n != gpu_count:
+                warns.append(
+                    f"ONEAPI_DEVICE_SELECTOR selects {n} level_zero device(s) "
+                    f"but GPU topology shows {gpu_count}"
+                )
+    else:
+        findings.append("ONEAPI_DEVICE_SELECTOR not set (all visible GPUs used)")
+
+    # --- ZE_AFFINITY_MASK ---
+    ze_mask = env_vars.get("ZE_AFFINITY_MASK")
+    if ze_mask is not None:
+        findings.append(f"ZE_AFFINITY_MASK={ze_mask}")
+        n = len([x for x in ze_mask.split(",") if x.strip()])
+        if gpu_count and n != gpu_count:
+            warns.append(
+                f"ZE_AFFINITY_MASK selects {n} device(s) but GPU topology shows "
+                f"{gpu_count} — mismatch affects tensor/data parallelism"
+            )
+
+    # --- SYCL_DEVICE_FILTER ---
+    sycl_filter = env_vars.get("SYCL_DEVICE_FILTER")
+    if sycl_filter is not None:
+        findings.append(f"SYCL_DEVICE_FILTER={sycl_filter}")
+        sfl = sycl_filter.lower().strip()
+        if "level_zero" not in sfl and not sfl.startswith("*"):
+            warns.append(
+                f"SYCL_DEVICE_FILTER={sycl_filter} does not select the level_zero "
+                f"backend — oneCCL/SYCL will not use the Intel GPUs"
+            )
+        if selector is not None:
+            warns.append(
+                "Both SYCL_DEVICE_FILTER and ONEAPI_DEVICE_SELECTOR are set — "
+                "they can conflict; prefer ONEAPI_DEVICE_SELECTOR on XPU"
+            )
+
+    # --- oneCCL collective transport ---
+    ccl_vars = {k: v for k, v in env_vars.items() if k.startswith("CCL_")}
+    for k in sorted(ccl_vars):
+        findings.append(f"{k}={ccl_vars[k]}")
+    if gpu_count and gpu_count > 1 and not ccl_vars:
+        findings.append(
+            "No CCL_* variables set — oneCCL uses defaults (fine single-node; "
+            "multi-node may need CCL_KVS / transport configuration)"
+        )
+    fi_provider = env_vars.get("FI_PROVIDER")
+    if fi_provider is not None:
+        findings.append(f"FI_PROVIDER={fi_provider} (libfabric provider for oneCCL inter-node)")
+
+    # --- Intel Extension for PyTorch ---
+    for k in sorted(env_vars):
+        if k.startswith("IPEX_"):
+            findings.append(f"{k}={env_vars[k]}")
+
+    # --- UCX must use the Level Zero transport to move XPU memory ---
+    ucx_tls = env_vars.get("UCX_TLS")
+    if ucx_tls is not None:
+        tls = [t.strip().lower() for t in ucx_tls.split(",")]
+        if not any(t.startswith("ze") for t in tls):
+            warns.append(
+                f"UCX_TLS={ucx_tls} has no Level Zero ('ze') transport — "
+                f"UCX will not transfer XPU memory directly (falls back to host copies)"
+            )
+
+    # --- Vendor mismatch: NCCL/CUDA vars have no effect on XPU ---
+    nccl_set = sorted(k for k in env_vars if k.startswith(("NCCL_", "NVSHMEM_")))
+    if nccl_set:
+        warns.append(
+            f"NCCL/NVSHMEM variables set on an Intel XPU pod "
+            f"({', '.join(nccl_set[:5])}{'...' if len(nccl_set) > 5 else ''}) — "
+            f"no effect; XPU collectives use oneCCL (CCL_*)"
+        )
+    cuda_set = sorted(k for k in env_vars if k.startswith("CUDA_"))
+    if cuda_set:
+        warns.append(
+            f"CUDA_* variables set on an Intel XPU pod ({', '.join(cuda_set)}) — "
+            f"XPU visibility is controlled by ZE_AFFINITY_MASK / "
+            f"ONEAPI_DEVICE_SELECTOR, not CUDA_VISIBLE_DEVICES"
+        )
+
+    # --- NIXL / disaggregated KV transfer over XPU ---
+    nixl_vars = {k: v for k, v in env_vars.items() if k.startswith("NIXL_")}
+    if nixl_vars and not rdma_devices and not any(k.startswith("UCX_") for k in env_vars):
+        warns.append(
+            "NIXL (disaggregated KV transfer) configured on XPU without RDMA devices "
+            "or UCX transport — KV transfer may use slow host/TCP paths"
+        )
+
+    return findings, warns
+
+
 def _check_gpu_numa_affinity(pod_name, gpu_labels, connections, vendor="nvidia"):
     """Check whether GPUs in a pod are on the same NUMA node / PCIe root.
 
@@ -1716,7 +2144,7 @@ def _discover_pod_topology(pod_name, short, out):
 
     p(f"\n--- {short} ({pod_name}) ---\n")
 
-    # Detect GPU vendor (nvidia vs amd)
+    # Detect GPU vendor (nvidia vs amd vs xpu)
     vendor = _detect_gpu_vendor(pod_name)
     pod_topo["gpu_vendor"] = vendor
     if vendor == "amd":
@@ -1724,25 +2152,34 @@ def _discover_pod_topology(pod_name, short, out):
         p(f"  GPU vendor: AMD (using {amd_tool})\n")
     elif vendor == "nvidia":
         p(f"  GPU vendor: NVIDIA (using nvidia-smi)\n")
+    elif vendor == "xpu":
+        p(f"  GPU vendor: Intel XPU (using xpu-smi)\n")
     else:
-        p(f"  GPU vendor: not detected (no nvidia-smi, rocm-smi, or amd-smi found)\n")
+        p(f"  GPU vendor: not detected (no nvidia-smi, rocm-smi, amd-smi, or xpu-smi found)\n")
 
     # 1. GPU topology matrix
     if vendor == "nvidia":
         topo_cmd = "nvidia-smi topo -m"
     elif vendor == "amd":
         topo_cmd = "amd-smi topology" if _get_amd_tool(pod_name) == "amd-smi" else "rocm-smi --showtopo"
+    elif vendor == "xpu":
+        topo_cmd = "xpu-smi topology -m"
     else:
         topo_cmd = "GPU topology"
     p(f"  Checking GPU topology ({topo_cmd}) ... ")
     topo_out, topo_ok = _get_gpu_topo(pod_name, vendor)
+    if topo_ok and vendor == "xpu":
+        connections, gpu_labels = _parse_xpu_topo(topo_out)
+        if not gpu_labels:
+            topo_ok = False
+            pod_warnings.append(f"{short}: could not parse XPU topology matrix")
     if topo_ok:
         p("OK\n")
         if vendor == "amd":
             connections, gpu_labels = _parse_rocm_topo(topo_out)
-        else:
+        elif vendor != "xpu":
             connections, gpu_labels = _parse_topo_matrix(topo_out)
-        has_nvlink, topo_summary = _check_nvlink_topology(connections, gpu_labels)
+        has_nvlink, topo_summary = _check_nvlink_topology(connections, gpu_labels, vendor)
         pod_topo["gpu_count"] = len(gpu_labels)
         pod_topo["has_nvlink"] = has_nvlink
         pod_topo["topo_summary"] = topo_summary
@@ -1751,15 +2188,27 @@ def _discover_pod_topology(pod_name, short, out):
 
         # Use vendor-appropriate naming
         has_xgmi = any(c == "XGMI" for c in connections.values())
+        has_mdf = any(c in ("MDF", "XE", "XL", "XELINK") for c in connections.values())
         if has_nvlink:
-            status = "xGMI/Infinity Fabric" if has_xgmi else "NVLink/NVSwitch"
+            if has_xgmi:
+                status = "xGMI/Infinity Fabric"
+            elif has_mdf or vendor == "xpu":
+                status = "Xe Link/MDF fabric"
+            else:
+                status = "NVLink/NVSwitch"
         else:
             status = "PCIe only"
+        pod_topo["interconnect_name"] = status
         p(f"    GPUs: {len(gpu_labels)}, Interconnect: {status}\n")
         p(f"    Detail: {topo_summary}\n")
 
         if not has_nvlink and len(gpu_labels) > 1:
-            link_name = "xGMI" if vendor == "amd" else "NVLink"
+            if vendor == "amd":
+                link_name = "xGMI"
+            elif vendor == "xpu":
+                link_name = "Xe Link/MDF"
+            else:
+                link_name = "NVLink"
             pod_warnings.append(f"{short}: GPUs connected via PCIe only (no {link_name})")
 
         # Check for excessive hops between GPUs
@@ -1773,17 +2222,20 @@ def _discover_pod_topology(pod_name, short, out):
             if len(gpu_labels) > 1:
                 p(f"    Hop distance: OK (all pairs minimal)\n")
 
-        # Check NVSwitch domain uniformity
-        nvsw_uniform, nvsw_warns = _check_nvswitch_domains(connections, gpu_labels)
+        # Check fabric domain uniformity (NVSwitch / xGMI / Xe Link)
+        nvsw_uniform, nvsw_warns = _check_nvswitch_domains(connections, gpu_labels, vendor)
         pod_topo["nvswitch_uniform"] = nvsw_uniform
+        domain_name = {"nvidia": "NVSwitch domain",
+                       "amd": "xGMI domain",
+                       "xpu": "fabric domain"}.get(vendor, "fabric domain")
         if nvsw_warns:
-            p(f"    NVSwitch domain issues:\n")
+            p(f"    {domain_name} issues:\n")
             for nw in nvsw_warns:
                 p(f"      {nw}\n")
                 pod_warnings.append(f"{short}: {nw}")
         else:
             if has_nvlink and len(gpu_labels) > 1:
-                p(f"    NVSwitch domain: OK (all GPUs in same domain)\n")
+                p(f"    {domain_name}: OK (all GPUs in same domain)\n")
 
         # Check GPU NUMA affinity (cross-socket placement)
         gpu_numa, numa_warns = _check_gpu_numa_affinity(pod_name, gpu_labels, connections, vendor)
@@ -1845,28 +2297,41 @@ def _discover_pod_topology(pod_name, short, out):
     else:
         p("not available\n")
         pod_topo["has_nvlink"] = None
-        pod_topo["topo_summary"] = "GPU topology tool not available"
+        pod_topo["topo_summary"] = "GPU topology unavailable or unparseable"
 
-    # 2. NVLink / xGMI link status
+    # 2. Fabric link status (NVLink / xGMI / XPU P2P)
     if vendor == "nvidia":
         link_cmd = "nvidia-smi nvlink --status"
+        link_label = "NVLink"
     elif vendor == "amd":
         link_cmd = "amd-smi topology --weight" if _get_amd_tool(pod_name) == "amd-smi" else "rocm-smi --showtopoweight"
+        link_label = "xGMI"
+    elif vendor == "xpu":
+        link_cmd = "xpu-smi topology --p2p r"
+        link_label = "P2P (Xe Link/PCIe)"
     else:
         link_cmd = "GPU link status"
+        link_label = "Interconnect"
     p(f"  Checking link status ({link_cmd}) ... ")
     nvlink_out, nvlink_ok = _get_gpu_link_status(pod_name, vendor)
+    if nvlink_ok and vendor == "xpu":
+        try:
+            active, inactive = _parse_xpu_link_status(nvlink_out)
+        except ValueError as exc:
+            nvlink_ok = False
+            pod_warnings.append(f"{short}: {exc}")
     if nvlink_ok:
         p("OK\n")
         if vendor == "amd":
             active, inactive = _parse_rocm_link_status(nvlink_out)
-        else:
+        elif vendor != "xpu":
             active, inactive = _parse_nvlink_status(nvlink_out)
         pod_topo["nvlink_active"] = active
         pod_topo["nvlink_inactive"] = inactive
-        p(f"    NVLink connections: {active} active, {inactive} inactive\n")
+        p(f"    {link_label} links: {active} active, {inactive} inactive\n")
         if inactive > 0:
-            pod_warnings.append(f"{short}: {inactive} inactive NVLink connection(s)")
+            pod_warnings.append(
+                f"{short}: {inactive} inactive/unsupported {link_label} link(s)")
         if _get_common().VERBOSE and nvlink_out:
             for line in nvlink_out.split("\n"):
                 p(f"    | {line}\n")
@@ -1874,6 +2339,35 @@ def _discover_pod_topology(pod_name, short, out):
         p("not available\n")
         pod_topo["nvlink_active"] = 0
         pod_topo["nvlink_inactive"] = 0
+
+    # 2b. XPU health (xpu-smi health -l reports device + fabric port state)
+    if vendor == "xpu":
+        p("  Checking device/fabric health (xpu-smi health -l) ... ")
+        health_out, health_ok = _run_topo_cmd(
+            pod_name, ["xpu-smi", "health", "-l"], "xpu-smi health -l")
+        pod_topo["xpu_health"] = health_out or ""
+        if health_ok:
+            p("OK\n")
+            bad = []
+            unknown = 0
+            for ln in health_out.split("\n"):
+                m = re.match(r'\s*status\s+(\S+)', ln)
+                if m:
+                    st = m.group(1).upper()
+                    if st == "UNKNOWN":
+                        unknown += 1  # unsupported component (e.g. memory_health)
+                    elif st != "OK":
+                        bad.append(f"{ln.strip()} (status={m.group(1)})")
+                elif re.search(r'\b(critical|failed|failure)\b', ln, re.IGNORECASE):
+                    bad.append(ln.strip())
+            for b in bad[:5]:
+                p(f"    WARNING: {b}\n")
+                pod_warnings.append(f"{short}: XPU health — {b}")
+            if not bad:
+                extra = f" ({unknown} component(s) Unknown/unsupported)" if unknown else ""
+                p(f"    Device/fabric health: OK{extra}\n")
+        else:
+            p("not available\n")
 
     # 3. lscpu (CPU/NUMA topology)
     p("  Checking CPU topology (lscpu) ... ")
@@ -1906,12 +2400,13 @@ def _discover_pod_topology(pod_name, short, out):
     pci_nvswitch = 0
     if lspci_ok:
         p("OK\n")
-        # Show NVIDIA/AMD GPU and Mellanox/ConnectX lines
+        # Show NVIDIA/AMD/Intel GPU and Mellanox/ConnectX lines
         gpu_lines = []
         for line in lspci_out.split("\n"):
             ll = line.lower()
-            if any(k in ll for k in ["nvidia", "mellanox", "connectx", "infiniband",
-                                      "advanced micro devices", "amd/ati", "instinct", "radeon"]):
+            if (any(k in ll for k in ["nvidia", "mellanox", "connectx", "infiniband",
+                                      "advanced micro devices", "amd/ati", "instinct", "radeon"])
+                    or _is_intel_gpu_line(ll)):
                 gpu_lines.append(line.rstrip())
             # Classify PCI devices
             if "nvidia" in ll and "nvswitch" in ll:
@@ -1927,6 +2422,8 @@ def _discover_pod_topology(pod_name, short, out):
                                      or "mi100" in ll or "display controller" in ll
                                      or "mi308" in ll):
                 pci_gpus.append(line.strip())
+            elif _is_intel_gpu_line(ll):
+                pci_gpus.append(line.strip())
             if any(k in ll for k in ["mellanox", "connectx", "infiniband"]):
                 # Only count physical functions, not VFs
                 if "virtual function" not in ll:
@@ -1936,7 +2433,7 @@ def _discover_pod_topology(pod_name, short, out):
             for line in gpu_lines:
                 p(f"      {line}\n")
         else:
-            p("    No NVIDIA/Mellanox PCI devices found in tree\n")
+            p("    No recognized GPU/NIC PCI devices found in tree\n")
         if _get_common().VERBOSE:
             for line in lspci_out.split("\n"):
                 p(f"    | {line}\n")
@@ -1946,8 +2443,8 @@ def _discover_pod_topology(pod_name, short, out):
     pod_topo["pci_nic_count"] = len(pci_nics)
     pod_topo["pci_nvswitch_count"] = pci_nvswitch
 
-    # 5. NCCL environment variable validation
-    p("  Checking NCCL environment variables ... ")
+    # 5. NCCL/UCX/RDMA environment variable validation
+    p("  Checking NCCL/UCX/RDMA environment variables ... ")
     nccl_env = _fetch_nccl_env(pod_name)
     rdma_devs = _fetch_rdma_devices(pod_name)
     net_ifaces = _fetch_net_interfaces(pod_name)
@@ -1963,6 +2460,18 @@ def _discover_pod_topology(pod_name, short, out):
     for nw in nccl_warns:
         p(f"    WARNING: {nw}\n")
         pod_warnings.append(f"{short}: {nw}")
+
+    # 5a. XPU / oneAPI / Level Zero / oneCCL environment variable validation
+    if vendor == "xpu":
+        p("  Checking XPU/oneAPI environment ... ")
+        gpu_count_val = pod_topo.get("gpu_count", 0)
+        xpu_findings, xpu_warns = _validate_xpu_env(nccl_env, gpu_count_val, rdma_devs)
+        p(f"found {len([k for k in nccl_env if k.startswith(('ONEAPI_','ZE_','SYCL_','CCL_','IPEX_','XPU_'))])} var(s)\n")
+        for f in xpu_findings:
+            p(f"    {f}\n")
+        for xw in xpu_warns:
+            p(f"    WARNING: {xw}\n")
+            pod_warnings.append(f"{short}: {xw}")
 
     # 5b. vLLM / CUDA / PyTorch / NIXL environment variable validation
     vllm_cuda_vars = {k: v for k, v in nccl_env.items()
@@ -2116,7 +2625,10 @@ def run_topology_validation(pods, display_names):
                        "VLLM_HOST_IP", "VLLM_DISABLE_PYNCCL",
                        "VLLM_DP_SIZE", "VLLM_TARGET_DEVICE",
                        "VLLM_WORKER_MULTIPROC_METHOD",
-                       "NIXL_ETCD_ENDPOINTS", "NIXL_ETCD_NAMESPACE"]
+                       "NIXL_ETCD_ENDPOINTS", "NIXL_ETCD_NAMESPACE",
+                       "ONEAPI_DEVICE_SELECTOR", "ZE_AFFINITY_MASK",
+                       "SYCL_DEVICE_FILTER", "CCL_KVS", "CCL_WORKER_COUNT",
+                       "CCL_PROCESS_LAUNCHER", "FI_PROVIDER"]
 
     env_mismatches = {}  # var -> {value -> [pod_short_names]}
     rdma_vals = {}       # tuple(device_list) -> [pod_short_names]
@@ -2155,6 +2667,9 @@ def run_topology_validation(pods, display_names):
     print("            Routed through NVSwitch on multi-GPU systems.")
     print("    NVL   = NVIDIA NVLink (alternate notation in some driver versions)")
     print("    XGMI  = AMD Infinity Fabric / xGMI link (direct GPU-GPU interconnect)")
+    print("    MDF   = Intel XPU Multi-Die Fabric Interface (tile/fabric link, e.g.")
+    print("            between tiles of a Data Center GPU). XE/XL = Intel Xe Link")
+    print("            (GPU-to-GPU fabric on Data Center GPU Max class parts).")
     print()
     print("  PCIe paths (lower bandwidth, higher latency):")
     print("    PIX   = same PCIe switch (1 PCIe hop, best PCIe path)")
@@ -2166,12 +2681,14 @@ def run_topology_validation(pods, display_names):
     print("            inter-CPU link, highest latency)")
     print()
     print("  Readiness:")
-    print("    NVLink/xGMI-READY = all GPU pairs connected via NV#/NVL/XGMI — optimal")
-    print("                        for collective operations (allreduce, allgather)")
+    print("    Fabric-READY      = all GPU pairs connected via a high-bandwidth fabric")
+    print("                        (NV#/NVL, XGMI, MDF/Xe Link) — optimal for collective")
+    print("                        operations (allreduce, allgather)")
     print("    PCIe only         = no high-bandwidth GPU interconnect — communication")
     print("                        goes through PCIe, significantly lower bandwidth")
     print()
-    print("  Commands: nvidia-smi topo -m (NVIDIA) | rocm-smi --showtopo / amd-smi topology (AMD)")
+    print("  Commands: nvidia-smi topo -m (NVIDIA) | rocm-smi --showtopo / amd-smi topology (AMD)"
+          " | xpu-smi topology -m (Intel XPU)")
 
     # Cross-pod comparison
     print(f"\n{'─' * 50}")
@@ -2184,9 +2701,9 @@ def run_topology_validation(pods, display_names):
         gpu_count = topo.get("gpu_count", "?")
         has_nvlink = topo.get("has_nvlink")
         if has_nvlink is True:
-            link_str = "NVLink/NVSwitch"
+            link_str = topo.get("interconnect_name") or "high-bandwidth fabric"
         elif has_nvlink is False:
-            link_str = "PCIe only"
+            link_str = topo.get("interconnect_name") or "PCIe only"
         else:
             link_str = "unknown"
         nvl_active = topo.get("nvlink_active", 0)
@@ -2194,9 +2711,9 @@ def run_topology_validation(pods, display_names):
         nvsw_ok = topo.get("nvswitch_uniform")
         nvsw_str = ""
         if nvsw_ok is True:
-            nvsw_str = "  NVSwitch=uniform"
+            nvsw_str = "  domain=uniform"
         elif nvsw_ok is False:
-            nvsw_str = "  NVSwitch=SPLIT"
+            nvsw_str = "  domain=SPLIT"
         gpu_numa = topo.get("gpu_numa", {})
         numa_nodes_used = set(gpu_numa.values()) - {-1} if gpu_numa else set()
         numa_str = ""
@@ -2213,7 +2730,7 @@ def run_topology_validation(pods, display_names):
         elif len(root_ports) > 1:
             pcie_root_str = f"  PCIe={len(root_ports)}roots"
         print(f"  {short:{_get_common().DISPLAY_NAME_MAX_LEN}s}  GPUs={gpu_count}  "
-              f"Interconnect={link_str}  NVLinks={nvl_active} active/{nvl_inactive} inactive"
+              f"Interconnect={link_str}  Links={nvl_active} active/{nvl_inactive} inactive"
               f"{nvsw_str}{numa_str}{pcie_root_str}")
 
     # Check consistency across pods
@@ -2229,7 +2746,7 @@ def run_topology_validation(pods, display_names):
             nvswitch_states.add(topo["nvswitch_uniform"])
 
     if len(nvlink_states) > 1:
-        warnings.append("MISMATCH: pods have different GPU interconnect types (some NVLink, some PCIe)")
+        warnings.append("MISMATCH: pods have different GPU interconnect types (some fabric, some PCIe)")
     if len(gpu_counts) > 1:
         warnings.append(f"MISMATCH: pods have different GPU counts: {sorted(gpu_counts)}")
     if nvswitch_states == {True, False}:
@@ -2268,7 +2785,9 @@ def run_topology_validation(pods, display_names):
                 for pod_name, _ip in pods:
                     short = display_names[pod_name]
                     hnv = all_pod_results[pod_name].get("has_nvlink")
-                    label = "NVLink" if hnv is True else "PCIe only" if hnv is False else "unknown"
+                    label = (all_pod_results[pod_name].get("interconnect_name")
+                             or ("high-bandwidth fabric" if hnv is True
+                                 else "PCIe only" if hnv is False else "unknown"))
                     print(f"    {short:{name_w}s}  {label}")
 
             # RDMA device list consistency
@@ -2370,6 +2889,14 @@ def run_topology_validation(pods, display_names):
                  "| grep -iv bridge | head -1; true"],
                 timeout=15, use_debug=False,
             )
+        elif sample_vendor == "xpu":
+            result = exec_in_pod(
+                pod_name,
+                ["bash", "-c", "lspci 2>/dev/null | grep -iE "
+                 "'intel.*(graphics controller|display controller|processing accelerators|data center gpu)' "
+                 "| grep -iv bridge | head -1; true"],
+                timeout=15, use_debug=False,
+            )
         else:
             result = exec_in_pod(
                 pod_name,
@@ -2379,7 +2906,7 @@ def run_topology_validation(pods, display_names):
         if result.returncode == 0 and result.stdout.strip():
             line = result.stdout.strip()
             for marker in ["NVIDIA Corporation ", "Advanced Micro Devices, Inc. ",
-                           "AMD/ATI "]:
+                           "AMD/ATI ", "Intel Corporation "]:
                 if marker in line:
                     gpu_model = line.split(marker, 1)[1].strip()
                     break
@@ -2390,9 +2917,9 @@ def run_topology_validation(pods, display_names):
         print(f"  GPU:               {gpu_count} assigned to pod, model: {gpu_model}")
     else:
         print(f"  GPU:               {gpu_count} assigned to pod")
-    explain_cmd(f"{kx} nvidia-smi topo -m",
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor)}",
                 "count GPU rows (GPU0, GPU1, ...) for assigned GPUs")
-    explain_cmd(f"{kx} bash -c \"lspci | grep -i nvidia | grep -iv nvswitch\"",
+    explain_cmd(f"{kx} bash -c \"lspci | grep -iE 'nvidia|amd|intel' | grep -iv nvswitch\"",
                 "count lines for total GPUs on host PCI bus; extract model from description")
     if pci_gpu_total > gpu_count:
         print(f"                     ({pci_gpu_total} GPUs visible in PCI bus on host)")
@@ -2401,13 +2928,14 @@ def run_topology_validation(pods, display_names):
         explain_cmd(f"{kx} bash -c \"lspci | grep -i nvswitch | wc -l\"",
                     "count NVSwitch ASICs visible in PCI bus")
     if has_nvlink is True:
-        print(f"  GPU interconnect:  NVLink/NVSwitch (high-bandwidth GPU-GPU fabric)")
+        print(f"  GPU interconnect:  {sample.get('interconnect_name') or 'high-bandwidth fabric'} "
+              f"(high-bandwidth GPU-GPU fabric)")
     elif has_nvlink is False:
-        print(f"  GPU interconnect:  PCIe only (no NVLink between assigned GPUs)")
+        print(f"  GPU interconnect:  PCIe only (no high-bandwidth GPU interconnect between assigned GPUs)")
     else:
         print(f"  GPU interconnect:  unknown")
-    explain_cmd(f"{kx} nvidia-smi topo -m",
-                "if all GPU pairs show NV## (e.g. NV12, NV18) = NVLink; PIX/PXB/PHB/SYS = PCIe")
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor)}",
+                "NV## = NVLink, XGMI = Infinity Fabric, MDF/Xe Link = Intel fabric; PIX/PXB/PHB/SYS = PCIe")
 
     # RDMA / InfiniBand / RoCE
     rdma_devs = sample.get("rdma_devices", [])
@@ -2532,16 +3060,16 @@ def run_topology_validation(pods, display_names):
                     if g1 != g2 and conn != "X":
                         role_conn_types.add(conn)
 
-            nv_conns = sorted(c for c in role_conn_types if c.startswith("NV") or c == "NVL")
-            pcie_conns = sorted(c for c in role_conn_types if c in {"PIX", "PXB", "PHB", "NODE", "SYS"})
+            fabric_conns = sorted(c for c in role_conn_types if _is_fabric(c))
+            pcie_conns = sorted(c for c in role_conn_types if c in _PCIE_ONLY_TYPES)
 
             gc_str = "/".join(str(g) for g in sorted(role_gpu_counts))
             print(f"    GPUs per pod:    {gc_str}")
 
-            if nv_conns and not pcie_conns:
-                print(f"    GPU group:       NVLink-READY ({', '.join(nv_conns)})")
-            elif nv_conns and pcie_conns:
-                print(f"    GPU group:       mixed NVLink ({', '.join(nv_conns)}) + PCIe ({', '.join(pcie_conns)})")
+            if fabric_conns and not pcie_conns:
+                print(f"    GPU group:       Fabric-READY ({', '.join(fabric_conns)})")
+            elif fabric_conns and pcie_conns:
+                print(f"    GPU group:       mixed fabric ({', '.join(fabric_conns)}) + PCIe ({', '.join(pcie_conns)})")
             elif pcie_conns:
                 print(f"    GPU group:       PCIe only ({', '.join(pcie_conns)})")
             else:
@@ -2609,6 +3137,12 @@ def run_topology_validation(pods, display_names):
     all_nvl_active = [t.get("nvlink_active", 0) for t in all_pod_results.values()]
     all_nvswitch_uniform = [t.get("nvswitch_uniform") for t in all_pod_results.values()]
 
+    # Representative vendor / fabric name for vendor-aware wording.
+    sample_vendor_hl = next(
+        (t.get("gpu_vendor") for t in all_pod_results.values()
+         if t.get("gpu_vendor") not in (None, "unknown")), "unknown")
+    fabric_label = _fabric_label(sample_vendor_hl)
+
     # Collect all connection types observed across pods (excluding self/X)
     all_conn_types = set()
     for t in all_pod_results.values():
@@ -2641,17 +3175,17 @@ def run_topology_validation(pods, display_names):
             print(f"  GPU allocation:    {all_gpu_counts[0]} GPU(s) per pod, consistent across all {num_pods} pod(s)")
         else:
             print(f"  GPU allocation:    varies across pods — {dict(zip([display_names[p] for p, _ in pods], all_gpu_counts))}")
-    explain_cmd(f"{kx} nvidia-smi topo -m | grep -c '^GPU'",
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor_hl)}",
                 "count topo matrix rows to determine how many accelerators are assigned to the pod")
 
-    # Interconnect + NVLink-readiness assessment
+    # Interconnect + fabric-readiness assessment
     nvlink_pods = sum(1 for v in all_has_nvlink if v is True)
     pcie_pods = sum(1 for v in all_has_nvlink if v is False)
 
     # Classify observed connection types
-    nv_types = sorted(c for c in all_conn_types if c.startswith("NV") or c == "NVL")
-    pcie_types_seen = sorted(c for c in all_conn_types if c in {"PIX", "PXB", "PHB", "NODE", "SYS"})
-    other_types = sorted(all_conn_types - set(nv_types) - set(pcie_types_seen))
+    fabric_types = sorted(c for c in all_conn_types if _is_fabric(c))
+    pcie_types_seen = sorted(c for c in all_conn_types if c in _PCIE_ONLY_TYPES)
+    other_types = sorted(all_conn_types - set(fabric_types) - set(pcie_types_seen))
 
     if all_conn_types:
         print(f"  Connection types:  {', '.join(sorted(all_conn_types))} observed across all GPU pairs")
@@ -2660,29 +3194,32 @@ def run_topology_validation(pods, display_names):
             print(f"  Connection types:  N/A — single GPU per pod, no inter-GPU connections")
         else:
             print(f"  Connection types:  none detected")
-    explain_cmd(f"{kx} nvidia-smi topo -m",
-                "read the matrix values between GPU rows: NV## = NVLink, PIX/PXB/PHB/SYS = PCIe paths, X = self")
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor_hl)}",
+                "read the matrix values between GPU rows: "
+                "NV##/XGMI/MDF = high-bandwidth fabric, PIX/PXB/PHB/SYS = PCIe paths, X = self")
 
     if nvlink_pods == num_pods:
-        print(f"  GPU interconnect:  NVLink/NVSwitch on all {num_pods} pod(s)")
-        # Check if ALL GPU pairs use NVLink (fully NVLink-ready)
+        print(f"  GPU interconnect:  {fabric_label} on all {num_pods} pod(s)")
+        # Check if ALL GPU pairs use the fabric (fully fabric-ready)
         if pcie_types_seen:
             print(f"                     PARTIAL: some GPU pairs still use PCIe paths ({', '.join(pcie_types_seen)})")
-            print(f"                     Not all GPU pairs are NVLink-connected")
+            print(f"                     Not all GPU pairs are fabric-connected")
         else:
-            # All pairs connected via NV#
-            if nv_types:
+            if fabric_types:
                 widths = []
-                for nt in nv_types:
-                    suffix = nt[2:]
-                    if suffix.isdigit():
-                        widths.append(f"{nt} = {suffix} NVLink lanes")
-                    elif nt == "NVL":
-                        widths.append("NVL = NVLink")
-                width_desc = ", ".join(widths) if widths else ", ".join(nv_types)
-                print(f"                     NVLink-READY: all GPU pairs connected via NVLink ({width_desc})")
+                for nt in fabric_types:
+                    if nt.startswith("NV"):
+                        suffix = nt[2:]
+                        if suffix.isdigit():
+                            widths.append(f"{nt} = {suffix} NVLink lanes")
+                        else:
+                            widths.append(f"{nt} = NVLink")
+                    else:
+                        widths.append(nt)
+                width_desc = ", ".join(widths) if widths else ", ".join(fabric_types)
+                print(f"                     Fabric-READY: all GPU pairs connected via {fabric_label} ({width_desc})")
             else:
-                print(f"                     NVLink-READY: all GPU pairs connected via NVLink")
+                print(f"                     Fabric-READY: all GPU pairs connected via {fabric_label}")
     elif pcie_pods == num_pods:
         print(f"  GPU interconnect:  PCIe only on all {num_pods} pod(s)")
         if nvswitch_in_pci:
@@ -2691,7 +3228,7 @@ def run_topology_validation(pods, display_names):
             print(f"                     NVSwitch ASICs but pods only see a subset of GPUs without")
             print(f"                     NVLink connectivity between them")
     elif nvlink_pods > 0:
-        print(f"  GPU interconnect:  mixed — {nvlink_pods} pod(s) NVLink, {pcie_pods} pod(s) PCIe only")
+        print(f"  GPU interconnect:  mixed — {nvlink_pods} pod(s) fabric, {pcie_pods} pod(s) PCIe only")
 
     # Hop distance
     any_hop_issue = any("excessive hops" in w for w in warnings)
@@ -2700,7 +3237,7 @@ def run_topology_validation(pods, display_names):
         print(f"                     (SYS = cross-socket, PHB = cross PCIe root complex)")
     else:
         print(f"  Hop distance:      OK — no excessive hops between GPU pairs")
-    explain_cmd(f"{kx} nvidia-smi topo -m | grep -E 'SYS|PHB'",
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor_hl)} | grep -E 'SYS|PHB'",
                 "SYS = cross-socket hop (worst), PHB = cross PCIe root (bad); absence = good")
 
     # NUMA affinity
@@ -2771,7 +3308,7 @@ def run_topology_validation(pods, display_names):
             print(f"  PCIe switch topo:  could not determine")
         else:
             print(f"  PCIe switch topo:  OK — no PXB cross-switch connections detected")
-    explain_cmd(f"{kx} nvidia-smi topo -m | grep PXB",
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor_hl)} | grep PXB",
                 "PXB in matrix = cross PCIe switch (shared upstream); absence = all behind same switch")
     explain_cmd(
         f"{kx} bash -c \"nvidia-smi --query-gpu=index,gpu_bus_id --format=csv,noheader | "
@@ -2781,30 +3318,28 @@ def run_topology_validation(pods, display_names):
         f"echo GPU$idx: switch=$sw class=$class; done\"",
         "class 0x0604 = PCI bridge; same parent bridge = co-located, different = separate switches")
 
-    # NVSwitch domain
+    # Fabric domain (NVSwitch / xGMI / Xe Link)
     if any(v is True for v in all_has_nvlink):
         if all(v is True for v in all_nvswitch_uniform if v is not None):
-            print(f"  NVSwitch domain:   uniform — all GPUs in same NVLink group per pod")
+            print(f"  Fabric domain:     uniform — all GPUs in same {fabric_label} group per pod")
         elif any(v is False for v in all_nvswitch_uniform):
-            print(f"  NVSwitch domain:   SPLIT — GPUs span different NVSwitch domains in some pods")
+            print(f"  Fabric domain:     SPLIT — GPUs span different {fabric_label} domains in some pods")
         else:
-            print(f"  NVSwitch domain:   uniform — no split detected")
+            print(f"  Fabric domain:     uniform — no split detected")
     else:
-        print(f"  NVSwitch domain:   N/A — no NVLink connections active in pods")
-    explain_cmd(f"{kx} nvidia-smi topo -m",
-                "uniform = all NV## values identical between GPU pairs; different NV## values = split domains")
+        print(f"  Fabric domain:     N/A — no fabric connections active in pods")
+    explain_cmd(f"{kx} {_vendor_topo_cmd(sample_vendor_hl)}",
+                "uniform = identical fabric widths between GPU pairs; different widths = split domains")
 
-    # NVLink status
+    # Fabric link status
     total_active = sum(all_nvl_active)
     total_inactive = sum(t.get("nvlink_inactive", 0) for t in all_pod_results.values())
     if total_active > 0 or total_inactive > 0:
-        print(f"  NVLink status:     {total_active} active, {total_inactive} inactive across all pods")
+        print(f"  Fabric link status:{total_active} active, {total_inactive} inactive across all pods")
         if total_inactive > 0:
-            print(f"                     WARNING: inactive NVLink connections may indicate hardware issues")
+            print(f"                     WARNING: inactive/unsupported links may indicate hardware issues")
     else:
-        print(f"  NVLink status:     no active NVLink connections in any pod")
-    explain_cmd(f"{kx} nvidia-smi nvlink --status | grep -cE '(active|inactive)'",
-                "count active/inactive NVLink connections per GPU")
+        print(f"  Fabric link status: no active fabric links in any pod")
 
     # NCCL config
     nccl_envs = [t.get("nccl_env", {}) for t in all_pod_results.values()]
@@ -2891,15 +3426,18 @@ def run_topology_validation(pods, display_names):
                 sample_val = next((e[var_name] for e in nccl_envs if e.get(var_name)), "")
                 print(f"    {var_name}: {sample_val} ({desc})")
 
-    # vLLM / CUDA / NIXL config summary
+    # vLLM / CUDA / XPU / NIXL config summary
     vllm_pods = sum(1 for e in nccl_envs if any(k.startswith("VLLM_") for k in e))
     cuda_pods = sum(1 for e in nccl_envs if any(k.startswith("CUDA_") for k in e))
     nixl_pods = sum(1 for e in nccl_envs if any(k.startswith("NIXL_") for k in e))
+    xpu_env_pods = sum(1 for e in nccl_envs
+                       if any(k.startswith(("ONEAPI_", "ZE_", "SYCL_", "CCL_", "IPEX_", "XPU_"))
+                              for k in e))
 
-    if vllm_pods > 0 or cuda_pods > 0 or nixl_pods > 0:
+    if vllm_pods > 0 or cuda_pods > 0 or nixl_pods > 0 or xpu_env_pods > 0:
         print(f"\n  Inference runtime config:")
-        explain_cmd(f"{kx} bash -c \"env | grep -E '^(VLLM_|CUDA_|TORCH_|NIXL_|MASTER_|RANK=|WORLD_SIZE=|LOCAL_RANK=)' | sort\"",
-                    "all vLLM, CUDA, PyTorch distributed, and NIXL environment variables")
+        explain_cmd(f"{kx} bash -c \"env | grep -E '^(VLLM_|CUDA_|TORCH_|NIXL_|MASTER_|RANK=|WORLD_SIZE=|LOCAL_RANK=|ONEAPI_|ZE_|SYCL_|CCL_)' | sort\"",
+                    "all vLLM, CUDA, XPU/oneAPI, PyTorch distributed, and NIXL environment variables")
 
         # CUDA config
         if cuda_pods > 0:
@@ -2960,6 +3498,28 @@ def run_topology_validation(pods, display_names):
 
         explain_cmd(f"{kx} bash -c \"env | grep -E '^VLLM_'\"",
                     "vLLM inference engine configuration variables")
+
+        # Intel XPU / oneAPI / Level Zero / oneCCL config
+        if xpu_env_pods > 0:
+            sample_xpu = next((e for e in nccl_envs
+                               if any(k.startswith(("ONEAPI_", "ZE_", "SYCL_", "CCL_", "IPEX_"))
+                                      for k in e)), {})
+            print(f"    XPU/oneAPI:      configured on {xpu_env_pods}/{num_pods} pod(s)")
+            for var_name, desc in [
+                ("ONEAPI_DEVICE_SELECTOR", "SYCL backend:device selection"),
+                ("ZE_AFFINITY_MASK", "Level Zero device visibility"),
+                ("SYCL_DEVICE_FILTER", "SYCL device filter"),
+                ("CCL_KVS", "oneCCL key-value store (multi-node)"),
+                ("CCL_WORKER_COUNT", "oneCCL worker threads"),
+                ("CCL_PROCESS_LAUNCHER", "oneCCL process launcher"),
+                ("FI_PROVIDER", "libfabric provider for oneCCL"),
+                ("IPEX_VERBOSE", "Intel Extension for PyTorch verbosity"),
+            ]:
+                val = sample_xpu.get(var_name)
+                if val:
+                    print(f"    {var_name}: {val} ({desc})")
+        explain_cmd(f"{kx} bash -c \"env | grep -E '^(ONEAPI_|ZE_|SYCL_|CCL_|IPEX_)'\"",
+                    "Intel XPU device selection and oneCCL collective configuration")
 
         # NIXL / llm-d disaggregated KV transfer
         if nixl_pods > 0:

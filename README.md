@@ -4,7 +4,7 @@ This repository includes [Agentic Skills](https://agentskills.io/home) that auto
 
 ## Preflight Checks Skill
 
-The [`/llm-d-preflight-checks`](skills/llm-d-preflight-checks/SKILL.md) skill patches an llm-d model server deployment to run a [diagnostics script](skills/llm-d-preflight-checks/scripts/llm-d-preflight-checks.py) before vLLM starts. It collects environment variables, GPU topology (`nvidia-smi topo -m`, NVLink status), and CPU/PCI info, giving operators a window to inspect the pod environment and run network tests before the model loads.
+The [`/llm-d-preflight-checks`](skills/llm-d-preflight-checks/SKILL.md) skill patches an llm-d model server deployment to run a [diagnostics script](skills/llm-d-preflight-checks/scripts/llm-d-preflight-checks.py) before vLLM starts. It collects environment variables, GPU topology (NVIDIA `nvidia-smi topo -m` / NVLink, AMD `rocm-smi`, Intel XPU `xpu-smi discovery/topology/health`), and CPU/PCI info, giving operators a window to inspect the pod environment and run network tests before the model loads.
 
 In `pause` mode (`LLMD_PREFLIGHT_CHECKS=pause`), the script starts an HTTP server on the vLLM port that satisfies K8s health probes while blocking vLLM startup. Call `/exit` on the server to release the port and let vLLM proceed. See the [SKILL.md](skills/llm-d-preflight-checks/SKILL.md) for deployment instructions covering the llm-d quickstart, P/D disaggregation, and llm-d-benchmark.
 
@@ -14,8 +14,8 @@ The problem addressed and design rationale is in [preflight-checks-design.md in 
 
 The [`/llm-d-networking-tests`](skills/llm-d-networking-tests/SKILL.md) skill validates GPU topology and inter-pod network performance for llm-d deployments. It drives the `run-tests.sh` automation scripts in this repo to:
 
-1. **Discover GPU topology** — verify that GPUs within each pod are optimally connected (NVLink/NVSwitch for NVIDIA, Infinity Fabric for AMD) rather than separated by PCIe hops across NUMA nodes.
-2. **Run network performance tests** — measure RDMA bandwidth and latency between pods using perftest (`ib_write_bw`, `ib_read_bw`), iperf3, NCCL/RCCL collectives, and nixlbench (GPU VRAM-to-VRAM via UCX).
+1. **Discover GPU topology** — verify that GPUs within each pod are optimally connected (NVLink/NVSwitch for NVIDIA, Infinity Fabric/xGMI for AMD, Xe Link/MDF for Intel XPU) rather than separated by PCIe hops across NUMA nodes.
+2. **Run network performance tests** — measure RDMA bandwidth and latency between pods using perftest (`ib_write_bw`, `ib_read_bw`), iperf3, NCCL/RCCL/oneCCL collectives, and nixlbench (GPU VRAM-to-VRAM via UCX).
 
 The skill asks for the target namespace and pod label selector, then runs the tests and helps interpret the results. See the [SKILL.md](skills/llm-d-networking-tests/SKILL.md) for the full testing workflow and troubleshooting guide.
 
@@ -29,6 +29,16 @@ docker tag nixl:latest ghcr.io/<>/nixl:latest
 docker push ghcr.io/<>/nixl:latest
 ```
 
+## Build XPU Image
+
+For Intel GPUs, `Dockerfile.xpu` adds diagnostic tools to the vLLM XPU image.
+
+```bash
+docker build -f Dockerfile.xpu -t pd-utils-xpu:latest .
+docker tag pd-utils-xpu:latest ghcr.io/<>/pd-utils-xpu:latest
+docker push ghcr.io/<>/pd-utils-xpu:latest
+```
+
 ## Deploy & Test
 
 ```bash
@@ -40,5 +50,3 @@ Use -rdma for the deployment in cluster with RoCE enabled for performance.
 This will deploy [nixl-client-roce](deployment/nixl_client_roce.yaml) and [nixl-server-roce](deployment/nixl_server_roce.yaml), 
 and run a benchmarking script to measure the transfer throughput (GB/s).
 Refer to [benchmarking](benchmarks/README.md) for more details.
-
-

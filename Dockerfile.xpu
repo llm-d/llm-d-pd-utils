@@ -1,0 +1,79 @@
+# syntax=docker/dockerfile:1
+# Intel GPU diagnostics, based on the same vLLM image as llm-d.
+# Build: docker build -f Dockerfile.xpu -t pd-utils-xpu:latest .
+
+ARG BASE_IMAGE=vllm/vllm-openai-xpu:v0.26.0
+
+# ===========================================================================
+# Build UCX with Level Zero IPC support (overlays the base's UCX)
+# ===========================================================================
+FROM ${BASE_IMAGE} AS ucx-build
+
+USER root
+# Pin the merged Level Zero IPC implementation.
+ARG UCX_VERSION=90c8961021dcf72357e076845857d7a235e2bb88
+
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        build-essential autoconf automake libtool pkg-config \
+        libibverbs-dev librdmacm-dev git wget ca-certificates \
+    && rm -rf /var/lib/apt/lists/* && \
+    git clone --filter=blob:none --no-checkout https://github.com/openucx/ucx /tmp/ucx_source && \
+    cd /tmp/ucx_source && \
+    git checkout --detach "${UCX_VERSION}" && \
+    bash autogen.sh && \
+    ./configure --prefix=/tmp/ucx_install_new --with-ze=yes --enable-examples --enable-mt && \
+    make CFLAGS="-Wno-error=incompatible-pointer-types" -j"$(nproc)" && make install && \
+    find /tmp/ucx_install_new -type f \( -name '*.a' -o -name '*.la' \) -delete && \
+    rm -rf /tmp/ucx_install_new/{include,share,etc,bin} /tmp/ucx_install_new/lib/cmake \
+           /tmp/ucx_source
+
+# ===========================================================================
+# Runtime
+# ===========================================================================
+FROM ${BASE_IMAGE}
+
+# Same as llm-d's Dockerfile.xpu: PyTorch XPU needs UMF at runtime.
+ENV LD_LIBRARY_PATH=/opt/intel/oneapi/umf/latest/lib:${LD_LIBRARY_PATH}
+
+USER root
+
+# Overlay the rebuilt UCX libraries onto the base's UCX install.
+RUN rm -rf /tmp/ucx_install/lib
+COPY --from=ucx-build /tmp/ucx_install_new/lib/ /tmp/ucx_install/lib/
+
+# Test tooling used by the networking tests (RDMA/iperf3/ssh for mpirun).
+RUN apt-get update -y && apt-get install -y --no-install-recommends \
+        perftest ibverbs-utils rdma-core \
+        iperf3 iputils-ping iproute2 net-tools pciutils \
+        openssh-server openssh-client \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install xpu-smi without upgrading the base Level Zero/GPU userspace:
+# replacing those libraries breaks oneCCL initialization.
+RUN apt-get update -y && \
+    apt-get install -y --no-install-recommends software-properties-common wget ca-certificates && \
+    add-apt-repository -y ppa:kobuk-team/intel-graphics && \
+    apt-get update -y && \
+    mkdir -p /tmp/xpu-m && cd /tmp/xpu-m && \
+    for p in libigsc1 intel-metrics-library libmetee6 libhwloc15 libpciaccess0; do apt-get download "$p" || true; done && \
+    wget -q https://github.com/intel/xpumanager/releases/download/v2.1.0/xpu-smi_2.1.0+26.33.6468cec-1.24.04_amd64.deb && \
+    dpkg -i --force-depends --force-overwrite /tmp/xpu-m/*.deb || true && \
+    cd / && rm -rf /tmp/xpu-m && \
+    add-apt-repository --remove -y ppa:kobuk-team/intel-graphics && \
+    apt-get update -y && \
+    test -x /usr/bin/xpu-smi
+
+# pd-utils scripts
+WORKDIR /opt/llm-d-pd-utils
+COPY skills/llm-d-networking-tests/scripts/ /opt/llm-d-pd-utils/skills/llm-d-networking-tests/scripts/
+COPY skills/llm-d-preflight-checks/scripts/ /opt/llm-d-pd-utils/skills/llm-d-preflight-checks/scripts/
+COPY run-tests.sh /opt/llm-d-pd-utils/run-tests.sh
+
+ENV PYTHONPATH=/opt/llm-d-pd-utils/skills/llm-d-networking-tests/scripts
+ENV PATH="/opt/llm-d-pd-utils:${PATH}"
+
+RUN python3 -m py_compile /opt/llm-d-pd-utils/skills/*/scripts/*.py && \
+    ./run-tests.sh --help >/dev/null
+
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

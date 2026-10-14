@@ -21,6 +21,19 @@ jobs:
           go-version: '1.24.0'
           cache-dependency-path: ./go.sum
 
+      - name: Python syntax and entry-point smoke check
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m py_compile skills/*/scripts/*.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
+          for script in \
+            run-tests.py run-tests-discovery.py run-tests-perftest.py \
+            run-tests-iperf3.py run-tests-nixlbench.py \
+            run-tests-ccl.py; do
+            python3 "skills/llm-d-networking-tests/scripts/$script" --help >/dev/null
+          done
+
       - name: Run markdown link checker
         uses: ./.github/actions/markdown-link-checker
         with:
