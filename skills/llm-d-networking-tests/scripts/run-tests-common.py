@@ -579,9 +579,13 @@ def _verify_cmd_inline(cmd, hint, indent):
         if "socket" in hint_lower or "numa" in hint_lower:
             check_terms.append(("socket", "numa", "node"))
         if "gpu" in hint_lower:
-            check_terms.append(("gpu", "nvidia"))
+            check_terms.append(("gpu", "nvidia", "intel", "xpu"))
         if "nccl" in hint_lower:
             check_terms.append(("nccl",))
+        if "xpu" in hint_lower or "intel" in hint_lower or "level_zero" in hint_lower:
+            check_terms.append(("intel", "xpu", "level_zero", "xe", "mdf"))
+        if "ccl" in hint_lower and "nccl" not in hint_lower:
+            check_terms.append(("ccl", "oneccl"))
         for term in check_terms:
             if isinstance(term, tuple):
                 found = any(t in stdout_lower for t in term)

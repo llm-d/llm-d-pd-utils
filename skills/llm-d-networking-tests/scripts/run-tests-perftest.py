@@ -275,6 +275,22 @@ def ensure_perftest(pod_name, out=None):
 
 
 def detect_rdma_device(pod_name):
+    # Prefer ibv_devices: it lists the devices libibverbs can actually use in
+    # this container.  /sys/class/infiniband can expose host-wide devices that
+    # are not allocated to the pod (e.g. DRA-based RDMA device assignment), in
+    # which case perftest fails with "IB device <name> not found".
+    # Portable parse (avoid awk '\s', which mawk does not support): ibv_devices
+    # prints two header lines, then one device per line.
+    result = exec_in_pod(
+        pod_name,
+        ["bash", "-c", "ibv_devices 2>/dev/null | awk 'NR>2 && NF {print $1}'; true"],
+        use_debug=False,
+    )
+    devs = [d for d in (result.stdout or "").split("\n") if d.strip()]
+    if result.returncode == 0 and devs:
+        return devs[0].strip()
+
+    # Fallback to sysfs
     result = exec_in_pod(pod_name, ["bash", "-c", "ls /sys/class/infiniband/ 2>/dev/null | head -1"], use_debug=False)
     dev = result.stdout.strip()
     if result.returncode != 0 or not dev:

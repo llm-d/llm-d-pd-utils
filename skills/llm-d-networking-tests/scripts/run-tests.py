@@ -14,8 +14,11 @@ By default only runs perftest.  Use --tests to select:
   --tests perftest          (default) RDMA latency & bandwidth
                             (ib_{read,write,send}_{lat,bw})
   --tests iperf3            iperf3 TCP bandwidth + UDP jitter/latency
-  --tests all               run both tests
-  --tests perftest,iperf3   same as all
+  --tests ccl               collective all_reduce (NVIDIA/AMD/Intel XPU)
+                            (alias: nccl-rccl)
+  --tests nixlbench         NIXL GPU VRAM-to-VRAM transfer (UCX)
+  --tests all               run all of the above
+  --tests perftest,iperf3   run a specific subset
 
 --rdma-block-sizes and --rdma-latency-size control RDMA perftest message sizes only.
 iperf3 uses its own defaults (128K TCP buffer, 8K UDP buffer).
@@ -86,8 +89,9 @@ Options:
                         (ib_{read,write,send}_lat). Does not affect iperf3.
                         (default: 2 bytes).
   -t, --tests TESTS     Comma-separated list of tests to run.
-                        Choices: perftest, iperf3, nccl-rccl, nixlbench, all
-                        (default: perftest).  When -t is given explicitly,
+                        Choices: perftest, iperf3, ccl, nixlbench, all
+                        (default: perftest; alias: nccl-rccl for ccl).
+                        When -t is given explicitly,
                         topology discovery is skipped (use -d to force it).
   -v, --verbose         Print kubectl/SSH commands as they run.
   -x, --explain-verify  Run each explain command and verify it produces
@@ -254,12 +258,14 @@ USE_DEBUG_CONTAINER = bool(DEBUG_IMAGE)
 DEBUG_SUFFIX = "-debug"
 
 # Resolve test list
-VALID_TESTS = {"perftest", "iperf3", "nccl-rccl", "nixlbench"}
-ALL_TESTS_ORDER = ["iperf3", "perftest", "nccl-rccl", "nixlbench"]  # default order for --tests all
+VALID_TESTS = {"perftest", "iperf3", "ccl", "nixlbench"}
+ALL_TESTS_ORDER = ["iperf3", "perftest", "ccl", "nixlbench"]  # default order for --tests all
+_TEST_ALIASES = {"nccl-rccl": "ccl", "collectives": "ccl"}
 if OPT_TESTS.strip().lower() == "all":
     SELECTED_TESTS = list(ALL_TESTS_ORDER)
 else:
     SELECTED_TESTS = [t.strip().lower() for t in OPT_TESTS.split(",") if t.strip()]
+    SELECTED_TESTS = [_TEST_ALIASES.get(t, t) for t in SELECTED_TESTS]
     unknown = set(SELECTED_TESTS) - VALID_TESTS
     if unknown:
         print(f"Error: unknown test(s): {', '.join(unknown)}.  Valid: {', '.join(sorted(VALID_TESTS))}, all", file=sys.stderr)
@@ -339,9 +345,9 @@ _ip3 = _import_module("run-tests-iperf3")
 run_iperf3 = _ip3.run_iperf3
 
 # ===========================================================================
-# NCCL/RCCL (in run-tests-nccl-rccl.py)
+# NCCL/RCCL/XCCL (in run-tests-ccl.py)
 # ===========================================================================
-_nccl = _import_module("run-tests-nccl-rccl")
+_nccl = _import_module("run-tests-ccl")
 run_nccl_rccl = _nccl.run_nccl_rccl
 
 # ===========================================================================
@@ -876,7 +882,7 @@ def main():
     dep_map = {
         "iperf3":    (["iperf3"],        "iperf3"),
         "perftest":  (PERFTEST_BINARIES, "perftest"),
-        # nccl-rccl manages its own deps (mpirun, openssh, nccl/rccl-tests)
+        # ccl manages its own deps (mpirun, openssh, nccl/rccl-tests, oneCCL)
         # inside run_nccl_rccl() — no upfront dep check needed.
         # nixlbench manages its own deps (nixlbench binary + etcd)
         # inside run_nixlbench() — no upfront dep check needed.
@@ -996,7 +1002,7 @@ def main():
     test_runners = {
         "iperf3":    run_iperf3,
         "perftest":  run_perftest,
-        "nccl-rccl": run_nccl_rccl,
+        "ccl":       run_nccl_rccl,
         "nixlbench": run_nixlbench,
     }
     all_results = {}
@@ -1007,7 +1013,7 @@ def main():
         all_results.update(results)
 
     # Separate matrix results (perftest, iperf3) from non-matrix results
-    # (nccl-rccl returns rows, not pod-pair matrices).
+    # (ccl returns rows, not pod-pair matrices).
     matrix_results = {k: v for k, v in all_results.items()
                       if isinstance(v, list) and v and isinstance(v[0], list)}
 
