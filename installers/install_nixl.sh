@@ -45,7 +45,7 @@ if [ ! -e "/dev/gdrdrv" ] || [ "$FORCE" = true ]; then
     
     cd ..
 else
-    echo "Found /dev/gdrdrv. Skipping gdrcopy installion"
+    echo "Found /dev/gdrdrv. Skipping gdrcopy installing"
 fi
 
 if ! command -v ucx_info &> /dev/null || [ "$FORCE" = true ]; then
@@ -89,7 +89,7 @@ if ! command -v ucx_info &> /dev/null || [ "$FORCE" = true ]; then
 
     cd ..
 else
-    echo "Found existing UCX. Skipping UCX installion"  
+    echo "Found existing UCX. Skipping UCX installing"  
 fi
 
 if ! command -v nixl_test &> /dev/null || [ "$FORCE" = true ]; then
@@ -104,5 +104,5 @@ if ! command -v nixl_test &> /dev/null || [ "$FORCE" = true ]; then
 
     cd ../..
 else
-    echo "Found existing NIXL. Skipping NIXL installion"  
+    echo "Found existing NIXL. Skipping NIXL installing"  
 fi
