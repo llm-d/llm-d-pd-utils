@@ -102,9 +102,14 @@ else
     echo "Starting tests!!!"
 
     if [ "$RDMA" = true ]; then
+        server_ip=$(oc get pod nixl-server-roce -o jsonpath='{.status.podIP}') || exit 1
+        if [ -z "$server_ip" ]; then
+            echo "Could not determine the IP address of nixl-server-roce" >&2
+            exit 1
+        fi
         oc exec nixl-server-roce -- sh -c "export UCX_TLS=$UCX_TLS_OPTS; nohup ucx_perftest -p 5555 > /dev/null 2>&1 &"
         sleep 2
-        oc exec nixl-client-roce -- sh -c "export UCX_TLS=$UCX_TLS_OPTS; ucx_perftest -t tag_bw -s 1048576 -n 100000 -D zcopy -p 5555 nixl-server"
+        oc exec nixl-client-roce -- sh -c "export UCX_TLS=$UCX_TLS_OPTS; ucx_perftest -t tag_bw -s 1048576 -n 100000 -D zcopy -p 5555 $server_ip"
     else
         oc exec nixl-server -- sh -c "export UCX_TLS=$UCX_TLS_OPTS; nohup ucx_perftest -p 5555 > /dev/null 2>&1 &"
         sleep 2
